@@ -1,0 +1,18 @@
+# 参考仓库（本地克隆，不入库）
+/SoL-Pi/
+/sol-opencode/
+/zcode-plugins/
+
+# spike 与临时产物（保留脚本，忽略运行痕迹）
+/spike/dev-marketplace/
+/tmp/
+*.log
+
+# node
+node_modules/
+
+# 运行数据（不入库：会话账本/对象可能含工作区路径）
+/plugin-data/
+
+# 系统
+.DS_Store

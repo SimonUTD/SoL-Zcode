@@ -61,5 +61,6 @@
 - 组合：全关→0 工具 0 事件；全开→工具恰 [edit,write,obs_recall,update_plan]、事件 11 个已知 key；配置 fail-closed。
 
 ## 9. 已发表数据（供对照，非同口径）
+> 来源注明（审核 m3）：以下数字**来自任务书与 SoL-OpenCode README.en.md:178-179 的转述**，未能在 SoL-Pi 本地克隆或其 GitHub README 中溯源核实；引用时须注明此口径。
 - vs Pi（EdgeBench）：tokens −45–49%，成本约 −⅓，分数 ~94%。
 - Terminal-Bench 4（63 题）：15/63 @ $211（Pi 18/63 @ $286）。

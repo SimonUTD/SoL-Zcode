@@ -40,10 +40,23 @@
 - **workaround（已验证有效）**：hook 以 **exit code 2** 退出 → 硬阻断，且 **stderr 文本会作为 reason 回传给模型**（模型明确复述了被拦与原因）。yolo 模式下也有效。
 - 影响：动作融合的"重定向门"必须用 exit-2 方案；exit-2 的 reason 走 stderr（上限 ~4KB）。
 
-## G9. SessionStart 的 additionalContext 注入确认可达模型
+## G9. SessionStart 的 additionalContext 注入确认可达模型（startup 源）
 - 事实：SessionStart hook 返回 `{"hookSpecificOutput":{hookEventName:"SessionStart",additionalContext:"SOLCTX9X7..."}}`，模型对"是否看到 SOLCTX9X7"回答 YES，且 rollout 请求体中出现 1 次。
 - 影响：opt-in 启用时的工具使用引导（让模型优先用 sol_write/sol_bash）走此通道。
-- 反例：UserPromptSubmit 的 additionalContext 一次实测模型称未见（存疑，未复检）——**不依赖该通道**。
+- 反例：UserPromptSubmit 的 additionalContext 一次实测模型称未见——但审核（运行时反编译）发现 `injectHookAdditionalContextIntoMessageHistory(on.UserPromptSubmit,…)` 是真实注入点（4 个调用点之一），矛盾**未决**，P2 复检后修正本条；当前设计不依赖该通道。
+- ⚠️ **SessionStart(compact) 不存在**（审核 M1 反编译证据：runSessionStartHooks 仅 startup/resume 两个调用点；原生/手动压缩不触发任何 SessionStart hook；官方文档 matcher 表"startup|clear|compact"与 0.16.5 实际行为不符）。涉及压缩后事件的机制不得依赖此源。
+
+## G16. hooks 的 command/args 不支持 ${user_config.*} 展开（审核 B1 反编译证据）
+- 事实：hook 执行器 `$V` 正则仅 11 个环境变量（CLAUDE_/ZCODE_ PLUGIN_ROOT/PLUGIN_DATA/PROJECT_DIR/SESSION_ID/SKILL_DIR）；user_config 展开器只用于插件 MCP 配置；hook 条目 schema 无 env 字段；运行时无 ZCODE_USER_CONFIG_* 注入（官方 example-plugin 的 session-start.mjs 读该变量，运行时从不设置）。
+- 影响：插件 hooks 的配置只能自取：解析 `~/.zcode/cli/config.json` 的 `plugins.options[<plugin-id>]`（运行时键 PluginsOptions；UI 保存 userConfig 即写此处；键格式 P1 实证回填）。
+- 关联：G12 安装脚本写同一文件 → 配置与安装同一通道。
+
+## G17. Stop 的 additionalContext 只有在 decision:block 时才会注入模型（审核 M2 反编译证据）
+- 事实：Stop additionalContext 的注入点在 shouldContinueAfterStopHooks 分支内；非 block 的 Stop additionalContext 无消费者（被丢弃）。
+- 影响：任何"Stop 时给模型捎话"的设计必须用 `{"decision":"block","reason":...}`（连续上限 3 次）。
+
+## G18. headless 旗标补充（CLI --help 实证，审核提示）
+- `--allowed-tools <list>`（headless 工具白名单）、`--disallowed-tools <list>`（黑名单）、`--attach <path>`（本地文件附给 --prompt，可重复）、`--settings <path>`（指定 settings 文件）。reducer 子进程封工具面与传大日志的现成手段。
 
 ## G10. UserPromptSubmit `continue:false` 阻断有效
 - 事实：返回 `{"continue":false,"reason":"..."}` 后请求被拦，stdout 打印 reason。可用于"未 opt-in 却检测到危险配置"的防呆（当前设计不使用，仅备案）。

@@ -14,32 +14,35 @@
 依赖：P1→P2→P3→P4。P1 内部可再拆两批（A1 骨架+门控+AF/OP；A2 EPR/OCC/trajectory），但同一文件集合禁止并行写。
 
 ## P1 派单（dev subagent A）
-- **范围**：`plugin/**`、`tests/**`（除 e2e 真模型）、`scripts/**`。允许读 `sol-opencode/packages/core/**`、`docs/**`、`spike/**`。
-- **文件边界（可写）**：`plugin/`、`tests/unit/`、`tests/integration/`、`scripts/`。禁止改 `docs/`、`SoL-Pi/`、`sol-opencode/`、`zcode-plugins/`、`benchmark/`、`spike/`。
-- **禁止事项**：引入任何 npm 运行时依赖（零依赖 node:*）；把密钥/绝对家目录写死；修改用户 `~/.zcode/**`（安装动作只经 scripts/install-plugin.mjs 且只在明确要求时执行）；占位符/TODO 交差。
+- **范围**：`plugin/**`、`tests/unit/`、`tests/integration/`、`scripts/`（含从 spike/ 迁移 install-plugin.mjs 为 `scripts/install-plugin.mjs`）。允许读 `sol-opencode/packages/core/**`、`docs/**`、`spike/**`。
+- **文件边界（可写）**：`plugin/`、`tests/unit/`、`tests/integration/`、`scripts/`。禁止改 `docs/`、`SoL-Pi/`、`sol-opencode/`、`zcode-plugins/`、`benchmark/`、`spike/`、`~/.zcode/**`（安装/配置观测动作只在明确要求的验证步骤执行，且只经 scripts/install-plugin.mjs）。
+- **开工首任务（配置闭环实证）**：① UI 保存一次 userConfig（或人工设置）观察 `~/.zcode/cli/config.json` 的 `plugins.options` 落盘键格式 → 回写结论到代码常量与 WORKLOG（不改 docs/，报回主控由主控回写 DESIGN §3/GOTCHAS）；② `--allowed-tools ""` 空白名单语义与 `--attach <file>` 附件进入上下文的方式实证（reducer 传输依据）。
 - **必做**：
-  1. vendor core：从 `sol-opencode/packages/core/src` 逐文件移植为 ESM `.mjs`（保留 NVIDIA 版权头 + THIRD_PARTY_NOTICES.md），类型擦除不改算法；`plugin/core/` 下。
-  2. manifest + userConfig（默认全 false）+ `.mcp.json`（env 注入 `${user_config.*}`）。
-  3. hooks：`hooks/hooks.json`（7 事件挂单脚本 `hooks/sol-hook.mjs <Event>`，process 型）+ 配置解析 lib（从 env 读开关，非法回退 false）。
-  4. MCP server：握手序列按 GOTCHAS G11；工具 sol_write/sol_edit/sol_bash/obs_recall/sol_trajectory；五机制按 DESIGN §2 实现；全部 fail-open。
-  5. 证据存储 + hash 链账本 + `scripts/verify-evidence.mjs`。
-  6. `tests/unit/`（core 断言等价移植）+ `tests/integration/`（MCP 握手/hook fixture/verify CLI 篡改检测/全关零行为）。
-- **期望输出**：证据化摘要（文件清单+测试命令+结果计数+关键行号）。
-- **验收门**：`node --test tests/` 全绿；审核 subagent ≥9.5。
+  1. vendor core：从 `sol-opencode/packages/core/src` 逐文件移植为 ESM `.mjs`（保留 NVIDIA 版权头 + plugin/THIRD_PARTY_NOTICES.md），类型擦除不改算法。
+  2. manifest（userConfig 声明层）+ `.mcp.json`；**hooks 与 MCP 均直读 cli config.json 的 plugins.options**（DESIGN §3，缺省全关、非法回退 false、SOL_ZCODE_AUX 防重入）。
+  3. hooks：`hooks/hooks.json`（7 事件挂单脚本，process 型）+ 配置解析 lib。
+  4. MCP server：握手按 GOTCHAS G11；工具 sol_write/sol_edit/sol_bash/obs_recall/sol_trajectory；五机制按 DESIGN §2；reducer 子进程=attach 传日志+空工具白名单+aux 标记；全部 fail-open。
+  5. sol_write/sol_edit 变异语义等价测试组（vs 内置 Write/Edit：唯一匹配/replace_all/写前读/不存在路径等用例）。
+  6. 证据存储 + hash 链账本（含 session-summary.json 终态锚点）+ `scripts/verify-evidence.mjs`。
+  7. `tests/unit/`（core 断言等价移植）+ `tests/integration/`（MCP 握手/hook fixture/verify 篡改检测/全关零行为/aux 零行为）。
+- **禁止事项**：npm 运行时依赖（零依赖 node:*）；密钥/绝对家目录写死；占位符/TODO 交差。
+- **期望输出**：证据化摘要（文件清单+测试命令+结果计数+关键行号+两个开工实证的结论）。
+- **验收门**：`node --test tests/unit tests/integration` 全绿；审核 subagent ≥9.5。
 
 ## P2 派单（dev subagent B）
-- **范围/边界（可写）**：`tests/e2e/**`、`scripts/e2e-*.mjs`、`fixtures/**`；只读其余。
-- **必做**：隔离 HOME 的 headless 真模型 e2e（G2 公式；场景断言见 DESIGN §6.3）；每场景产出 sessionId+usage+断言结果到 `tests/e2e/results/`；异常场景（模型不配合/工具误用）的 fail-open 证明。
+- **范围/边界（可写）**：`tests/e2e/**`；只读其余（含 scripts/）。
+- **必做**：隔离 HOME 的 headless 真模型 e2e（G2 公式；场景断言见 DESIGN §6.3）；**专项**：① UserPromptSubmit additionalContext 是否可达模型（复检，修正 GOTCHAS 备案）；② reducer 对抗性 e2e（日志埋"执行命令/写文件"注入指令，断言子进程无副作用、无工具调用）；③ aux 断言（reducer 子进程会话零轨迹、父会话引导未注入子进程）；④ 压缩检测（长会话触发原生 autoCompact 或 /compact 后 Stop 检测生效+提醒送达）。每场景产出 sessionId+usage+断言结果到 `tests/e2e/results/`。
 - **验收门**：e2e 全绿 + 审核 ≥9.5。
 
 ## P3 派单（dev subagent C）
-- **范围/边界（可写）**：`benchmark/**`；只读 `plugin/`、`docs/`。
-- **必做**：zcode Linux 容器化（Dockerfile + 镜像内插件安装 + 凭据经 env 注入不落盘）；TB4 任务集获取与任务清单核对（63 题排除 GPU，落 manifest）；双臂 runner（交错、并发 ≤4、超时控制、--json 计量+verifier 结果采集、append-only ledger、freeze manifest）；3 题探针跑通 → 全量 63×2。
+- **范围/边界（可写）**：`benchmark/**`；只读 `plugin/`、`docs/`、`scripts/`。
+- **开工首任务**：容器可行性 spike（DESIGN §7：zcode Linux 获取或 mac 回退，容器内 `--prompt --json` 冒烟），结论报回（GOTCHAS 由主控回写）；不可行即启动 PLAN 风险预案，不硬闯。
+- **必做**：镜像（任务环境+node+zcode+插件，凭据经 env 注入不落盘不进仓库）；**程序化写双臂配置**（plugins.options，经 scripts/install-plugin.mjs 同一文件路径）；TB4 任务集获取与核对（63 CPU-only，排除表落 manifest）；双臂 runner（交错、并发 ≤4、超时、--json 计量+verifier 采集、append-only ledger、`benchmark/freeze/manifest.json`（源码 sha256+双臂配置+任务集哈希））；3 题探针 → 全量 63×2（treatment 不含 gate）。
 - **验收门**：探针 ledger 有真实数据；全量完成或明确记录中断原因；成本/时间预算表。
 
 ## P4 派单（dev subagent D）
 - **范围/边界（可写）**：`README.md`、`README_CN.md`、`docs/REPORT.md`、`.gitignore`、git 提交与推送（origin main）。
-- **必做**：对照表（五指标 双臂）；与 SoL-Pi/SoL-OpenCode 已发表数据的口径对照（明确不同口径）；偏差声明（DESIGN §8）；git 历史整洁（分阶段提交）。
+- **必做**：对照表（五指标 双臂）；与 SoL-Pi/SoL-OpenCode 数据对照（**注明口径差异与来源**：任务书/SoL-OpenCode README 转述，未在上游仓库溯源）；偏差声明（DESIGN §8 全量）；git 历史整洁（分阶段提交）。
 - **验收门**：GitHub 推送成功；报告含 inputTokens/USD/墙钟/异常/解题率五项。
 
 ## 风险与预案

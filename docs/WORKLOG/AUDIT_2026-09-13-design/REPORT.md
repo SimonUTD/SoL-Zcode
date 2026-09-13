@@ -1,6 +1,6 @@
 # 设计方案审核报告 — AUDIT_2026-09-13-design
 
-- 审核对象：`docs/DESIGN.md`（v1）、`docs/PLAN.md`（v1）、`docs/GOTCHAS.md`、`docs/RESEARCH/*.md`
+- 审核对象：`docs/DESIGN.md`（v1，§1–§8 为 v1 审核；v2 复审见文末「复审 v2」）、`docs/PLAN.md`（v1）、`docs/GOTCHAS.md`、`docs/RESEARCH/*.md`
 - 交叉材料：`SoL-Pi/`（本地克隆 d7ecfc0，2026-09-11）、`sol-opencode/`（本地克隆）、`zcode-plugins/`（官方市场仓库）、`/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`（0.16.5，只读反编译）
 - 审核方式：文档通读 → 上游常量/行号逐项比对 → 运行时（zcode.cjs）反编译核验 DESIGN 的关键 API 假设 → 官方插件仓库规范比对 → 基准公平性与派单边界推演
 - 日期：2026-09-13
@@ -203,3 +203,71 @@
 - "fail-open 优先于上游 fail-closed"（DESIGN §1）的本地化决策论证充分，与 C2 一致。
 - §8 已知限制清单的诚实度高于多数同类方案（无历史投影、原生输出不可改写、OCC 无触发 API、reducer 墙钟代价均已自曝）。
 - 基准纪律（freeze manifest、append-only ledger、探针先行、子集诚实标注）直接继承 held-out 做法且与编辑器无关部分移植得当。
+
+---
+
+# 复审 v2（2026-09-13，同日第二轮）
+
+- 对象：commit `7c831fc` "docs: revise design v2 per audit"（DESIGN v2 / PLAN v2 / GOTCHAS G9 修订+G16–G18 / RESEARCH §9 来源注）。
+- 方法：v1 问题清单逐条对照 v2 文本 → 对 v2 新引入的关键假设做运行时实证（本轮新增 4 组实测，见 §R3）→ DESIGN/PLAN 一致性复查。
+
+## R1. 总体结论
+
+**评分：8.5 / 10。** v1 的 1 BLOCKER + 6 MAJOR + 8 MINOR 中：**B1、M1、M2、M4、M5、M6 与全部 MINOR 已正确落实**；**M3 部分落实**——本轮实测发现其主路径 `--allowed-tools` 是**幻影旗标**（help 有、解析器拒，与 G3 `--max-turns` 同类缺陷），文内自带的 fallback（`--disallowed-tools` 枚举）实测可解析，应提为主路径。另发现 v2 新引入一处事实错误（`ZCODE_HOME` 不存在）与两处小瑕疵。
+
+"方案层承诺 + 开发层实证"的处理**总体可接受**：三项延后实证（plugins.options 键格式 / 空白名单语义 / UserPromptSubmit 复检）均满足"运行时已有支持性证据 + 失败模式 fail-safe（全关）+ 有明确的首任务与回写责任"三条件。唯一必须**现在**改的是 n1（幻影旗标）：这不是"语义未知"而是"已知损坏"，不应消耗一个 P1 周期去发现。修完 n1+n2 后即可开工，无需第三轮全审。
+
+## R2. 必改项逐条落实判定
+
+| 项 | 判定 | v2 证据 | 备注 |
+|---|---|---|---|
+| B1 hooks 配置通道 | **已落实（方案层）** | DESIGN §3:100-109：明确 hooks 不支持 `${user_config.*}` 的事实；单一事实源=cli config.json `plugins.options`，hooks 与 MCP 都直读、无第二快照（消除启动次序问题）；解析规则缺省全关；PLAN P1 开工首任务①实证键格式并回写 | 运行时佐证（本轮新增）：配置键 `PluginsOptions:"plugins.options"` 存在，按 plugin id（`name@marketplace`）索引；**hook 子进程 env 实含 `ZCODE_PLUGIN_ID/ZCODE_PLUGIN_NAME`**（hft 函数），id 不需从 seed 文件推导——建议 P1 直接用该 env。延后实证可接受（失败模式=全关，C2 安全侧） |
+| M1 压缩检测改道 | **已落实** | DESIGN §2.4-3:89：Stop 内 transcript 前后快照对比（条目数降 ≥30% 且会话未换），提醒改经下一次 Stop decision:block 注入；§8.9 偏差注记；PLAN P2 ④ 专项 e2e | 启发式方向保守（漏报不误报）；"transcript 压缩标记字段 P1 实证后加强"合理 |
+| M2 Stop 提醒通道 | **已落实** | DESIGN §2.4-1:87：改用 `{"decision":"block","reason":…}`（G17 语义）；自限连续 ≤2（宿主 3 留余量）+ 每会话总量 ≤3（对齐 sol-opencode maxAutoContinuations=3）；续跑成本如实计入基准；§8.3 更新 | block-无动作=花 token 送建议，与上游"压缩后续跑"语义相近但机制不同——已在偏差声明如实记录，可接受 |
+| M3 工具面封死 | **部分落实** | DESIGN §2.3:76：`--allowed-tools` 空白名单为主、`--disallowed-tools` 枚举为 fallback；P2 对抗性 e2e 已列 | **本轮实测：`--allowed-tools` 为幻影旗标**（§R3-1），主路径不可用；fallback `--disallowed-tools` 实测可解析（§R3-2）。需按 n1 修订 |
+| M4 --attach 传输 | **已落实（且本轮实证通过）** | DESIGN §2.3:75：日志写临时文件经 `--attach` 传，规避 MAX_ARG_STRLEN；prompt 只含指令 | **实测端到端验证**（§R3-3）：附件内容确实进入模型上下文（模型准确复述文件内标记），usage 正常产出。M4 由"方案承诺"升级为"已实证" |
+| M5 防重入 | **已落实** | DESIGN §2.3:77 + §3:108：`SOL_ZCODE_AUX=1`，hooks/MCP 启动即查，aux 零行为；PLAN P1 测试项 + P2 ③ 断言 | 建议补一句：aux 会话 MCP tools/list 为空本身即第二层工具面防护（与 M3 互补），可在 §2.3 点明 |
+| M6 gate 矛盾 | **已落实** | DESIGN §7:136 "treatment 不含 actionFusionGate（gate 仅可选第三消融臂）"；§2.1/§5 同步；PLAN P3 "treatment 不含 gate" + 风险表一致 | 矛盾消除，双臂口径唯一 |
+| m1 C4 措辞 | 已落实 | DESIGN §2.1:62 修订 + §8.8 | "MCP 工具调用本身受宿主权限系统管辖（P1 实测各 mode 行为）"——合理的延后实证 |
+| m2 防篡改措辞 | 已落实 | DESIGN §4.3:114：可检测/不可检测分列；新增 session-summary.json 终态锚点 + 基准 ledger git commit 外部锚点 | 超出我方要求（主动加了双重锚点） |
+| m3 数据来源 | 已落实 | RESEARCH §9 来源注（任务书/SoL-OpenCode README 转述，未在上游溯源）；PLAN P4 引用注记 | |
+| m4 AF 偏差 | 已落实 | DESIGN §2.1:58：timeout 缺省=无超时（对齐上游 then-run.ts:26）；"最大的一处重写"入 §8.7；PLAN P1-5 等价测试组 | 新残留 n3（无超时挂死风险，见 §R4） |
+| m5 常量归属 | 已落实 | DESIGN §2.4:85 滑窗标注 sol-opencode 来源+偏差 §8.10；§5:125 FULL_SENDS 标注无行为作用 | "SessionStart payload 含 model"已核实官方文档确列（PLUGIN_DEVELOPMENT_CN.md:526），P1 实证合理 |
+| m6 派单缺口 | 已落实 | freeze→`benchmark/freeze/manifest.json`（P3 可写域内，两文档一致）；install-plugin.mjs 归 P1（从 spike 迁移）；P3 必做"程序化写双臂配置（plugins.options）" | |
+| m7 Linux 构建 | 已落实 | DESIGN §7:139 + PLAN P3 开工首任务=容器可行性 spike，不预设存在 | |
+| m8 G9 复检 | 已落实 | GOTCHAS G9 修订（矛盾未决+P2 复检后修正本条）；PLAN P2 ① | |
+
+## R3. 本轮新增实测（v2 关键假设）
+
+1. **`--allowed-tools` 是幻影旗标**：`node zcode.cjs --prompt "hi" --allowed-tools "" --json` → `Unknown option '--allowed-tools'`（help 文本列出但解析器拒绝，与 G3 `--max-turns` 同一缺陷类）。
+2. **`--disallowed-tools` 可解析**：`--prompt "hi" --disallowed-tools "Bash" --json` 无 Unknown option 错误，正常推进到模型调用（超时截断为审核侧主动 kill）。
+3. **`--attach` 端到端有效**：`--attach /tmp/audit-probe.txt` + 要求复述文件标记 → 模型准确返回 `AUDIT-MARKER-7f3a9`；usage（provider 源、累加）正常。**M4 传输假设实证通过**。
+4. **`ZCODE_HOME` 不存在**：运行时全文仅 1 处命中（telemetry 设备 ID 缓存路径）；配置/存储 home 由 `os.homedir()` 解析（`join(homedir(),".zcode","cli","config.json")`），另有 `storage.dir` 配置项（在 config.json 内定义，鸡生蛋）。**DESIGN §3/§6.3 的 ZCODE_HOME 说法错误。**
+
+另（反编译，无需实测）：hook 子进程 env 由 `hft` 注入 `ZCODE_PLUGIN_DATA/ID/NAME/ROOT`——B1 实现可直接取 `ZCODE_PLUGIN_ID` 作 `plugins.options` 的键。
+
+## R4. 新发现问题（v2 引入/暴露）
+
+- **n1（MAJOR）｜DESIGN.md:76 + GOTCHAS G18**：M3 主路径 `--allowed-tools` 实为幻影旗标。改法：`--disallowed-tools` 枚举全部内置工具 + 显式列出本插件 MCP 工具名（`mcp__sol__sol_write` 等）提为主路径；P1 首任务②改为验证 `--disallowed-tools` 对 `mcp__*` 工具的覆盖语义（help 称"从本次 runtime 工具集中移除"，覆盖面需实证）；§2.3 点明"SOL_ZCODE_AUX 使本插件 MCP tools/list 为空"是第二层防护；G18 加幻影警示（同 G3 类）。
+- **n2（MINOR）｜DESIGN.md:101,130**：`ZCODE_HOME` 不存在——§3"路径经 ZCODE_HOME 环境或默认 ~/.zcode"与 §6.3"临时 ZCODE_HOME 隔离副本"均错；且与 PLAN P2"隔离 HOME"（正确）不一致。改法：插件经 `os.homedir()/.zcode/cli/config.json` 解析；e2e/bench 隔离用 HOME 环境变量。
+- **n3（MINOR）｜DESIGN.md:58**：then_run timeout 缺省=无超时（对齐上游）+ MCP 工具调用级超时语义未验证 → 命令挂死会卡死会话。P1 增验：MCP tools/call 是否有宿主侧 deadline；若无，加宽安全阀（如 600s kill 进程组）并记 §8。
+- **n4（COSMETIC）｜GOTCHAS.md**：G16–G18 插在 G9 与 G10 之间，编号与物理顺序错乱。
+- **n5（COSMETIC）｜PLAN.md:1**：标题仍为"v1，待审"，未随本次修订更版本号。
+
+## R5. DESIGN/PLAN 一致性复查
+
+treatment 不含 gate（§7↔P3↔风险表）、freeze 路径（benchmark/freeze/manifest.json）、install-plugin 归属（P1）、P2 只写 tests/e2e、P4 来源注记——均一致。仅存 n2（ZCODE_HOME vs 隔离 HOME）与 n5（版本号）两处不齐。
+
+## R6. 评分与结论
+
+| 维度 | 权重 | 得分 | 依据 |
+|---|---|---|---|
+| 事实准确性 | 30% | 9.0 | v1 遗留全部修正；新 slips：--allowed-tools 未做解析级实测即写为主路径（GOTCHAS 自己有 G3 前科）、ZCODE_HOME |
+| 方案正确性（API 假设） | 30% | 8.5 | B1/M1/M2/M4 通道全部成立（M4 已实证）；M3 主路径幻影（有文内 fallback，n1）；n2/n3 |
+| 硬约束 C1–C4 | 20% | 8.5 | C2 闭环成立（fail-safe 缺省全关）；C4 声明诚实；aux 工具面待 n1 修订后完整 |
+| 完整性/基准/派单 | 20% | 9.0 | M6 消除；派单边界清晰无重叠；仅 n2/n5 表述不齐 |
+
+**加权 8.75 → 从严取 8.5 / 10。** 仍差 9.5 门的主因是 n1（安全控制主路径已知损坏，应文档内修正而非留给 P1 发现）。
+
+**结论**：n1、n2 为开工前必改（预计 10 分钟编辑量：§2.3/§3/§6.3/G18 四处）；n3 列入 P1 首任务验证清单；n4/n5 顺手修。**修完即可进入 P1，无需第三轮全审**（如需形式过门，可只对上述四处做快速 diff 复核）。
+

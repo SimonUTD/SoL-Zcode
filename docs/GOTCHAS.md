@@ -46,18 +46,6 @@
 - 反例：UserPromptSubmit 的 additionalContext 一次实测模型称未见——但审核（运行时反编译）发现 `injectHookAdditionalContextIntoMessageHistory(on.UserPromptSubmit,…)` 是真实注入点（4 个调用点之一），矛盾**未决**，P2 复检后修正本条；当前设计不依赖该通道。
 - ⚠️ **SessionStart(compact) 不存在**（审核 M1 反编译证据：runSessionStartHooks 仅 startup/resume 两个调用点；原生/手动压缩不触发任何 SessionStart hook；官方文档 matcher 表"startup|clear|compact"与 0.16.5 实际行为不符）。涉及压缩后事件的机制不得依赖此源。
 
-## G16. hooks 的 command/args 不支持 ${user_config.*} 展开（审核 B1 反编译证据）
-- 事实：hook 执行器 `$V` 正则仅 11 个环境变量（CLAUDE_/ZCODE_ PLUGIN_ROOT/PLUGIN_DATA/PROJECT_DIR/SESSION_ID/SKILL_DIR）；user_config 展开器只用于插件 MCP 配置；hook 条目 schema 无 env 字段；运行时无 ZCODE_USER_CONFIG_* 注入（官方 example-plugin 的 session-start.mjs 读该变量，运行时从不设置）。
-- 影响：插件 hooks 的配置只能自取：解析 `~/.zcode/cli/config.json` 的 `plugins.options[<plugin-id>]`（运行时键 PluginsOptions；UI 保存 userConfig 即写此处；键格式 P1 实证回填）。
-- 关联：G12 安装脚本写同一文件 → 配置与安装同一通道。
-
-## G17. Stop 的 additionalContext 只有在 decision:block 时才会注入模型（审核 M2 反编译证据）
-- 事实：Stop additionalContext 的注入点在 shouldContinueAfterStopHooks 分支内；非 block 的 Stop additionalContext 无消费者（被丢弃）。
-- 影响：任何"Stop 时给模型捎话"的设计必须用 `{"decision":"block","reason":...}`（连续上限 3 次）。
-
-## G18. headless 旗标补充（CLI --help 实证，审核提示）
-- `--allowed-tools <list>`（headless 工具白名单）、`--disallowed-tools <list>`（黑名单）、`--attach <path>`（本地文件附给 --prompt，可重复）、`--settings <path>`（指定 settings 文件）。reducer 子进程封工具面与传大日志的现成手段。
-
 ## G10. UserPromptSubmit `continue:false` 阻断有效
 - 事实：返回 `{"continue":false,"reason":"..."}` 后请求被拦，stdout 打印 reason。可用于"未 opt-in 却检测到危险配置"的防呆（当前设计不使用，仅备案）。
 
@@ -81,3 +69,24 @@
 - Docker 由 OrbStack 提供（macOS）；代理 `127.0.0.1:7890`（git clone GitHub 需要时用）；gh 已认证 SimonUTD（repo 权限）。
 - 官方插件市场源码与规范：`zai-org/zcode-plugins`（已克隆到 `./zcode-plugins/`，文档 `docs/PLUGIN_DEVELOPMENT_CN.md`）。
 - 参考实现已克隆：`./SoL-Pi/`（上游）、`./sol-opencode/`（OpenCode 移植，core 包零依赖可 vendor）。
+
+## G16. hooks 的 command/args 不支持 ${user_config.*} 展开（审核 B1 反编译证据）
+- 事实：hook 执行器 `$V` 正则仅 11 个环境变量（CLAUDE_/ZCODE_ PLUGIN_ROOT/PLUGIN_DATA/PROJECT_DIR/SESSION_ID/SKILL_DIR）；user_config 展开器只用于插件 MCP 配置；hook 条目 schema 无 env 字段；运行时无 ZCODE_USER_CONFIG_* 注入（官方 example-plugin 的 session-start.mjs 读该变量，运行时从不设置）。
+- 影响：插件 hooks 的配置只能自取：解析 `~/.zcode/cli/config.json` 的 `plugins.options`（形状见 G19）。
+- 关联：G12 安装脚本写同一文件 → 配置与安装同一通道。
+
+## G17. Stop 的 additionalContext 只有在 decision:block 时才会注入模型（审核 M2 反编译证据）
+- 事实：Stop additionalContext 的注入点在 shouldContinueAfterStopHooks 分支内；非 block 的 Stop additionalContext 无消费者（被丢弃）。
+- 影响：任何"Stop 时给模型捎话"的设计必须用 `{"decision":"block","reason":...}`（连续上限 3 次）。
+
+## G18. headless 工具限制/附件旗标：--disallowed-tools 有效，--allowed-tools 是幻影（实测）
+- `--disallowed-tools "Bash"`：**有效**——模型尝试执行被拒，复述"Bash 不可用"。
+- `--allowed-tools <list>`：**幻影旗标**——help 列出但解析器报 Unknown option（与 G3 --max-turns 同类缺陷），不可使用。
+- `--attach <path>`：有效（附件内容实测可达模型上下文）。
+- `--settings <path>`：存在（未测）。
+- 无 `ZCODE_HOME` 变量：home 由 os.homedir()（unix=HOME env）解析；子进程隔离用 HOME env 重定向（cli config 在 `<HOME>/.zcode/cli/config.json`）。
+
+## G19. plugins.options 的精确形状（运行时 schema 实证）
+- `plugins.options = { "<plugin-id>": { "<userConfigKey>": string|number|boolean } }`（`g.record(g.string(), g.record(g.string(), union(string|number|boolean)))`）。
+- plugin-id 与 enabledPlugins 同键域（`<name>@<marketplace>`）；hook 子进程 env 实含 `ZCODE_PLUGIN_ID` 可直接作键。
+- UI 保存插件 userConfig 即写此处；脚本可程序化写入（安装与基准双臂配置同一通道）。

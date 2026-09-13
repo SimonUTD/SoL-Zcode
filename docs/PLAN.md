@@ -1,4 +1,4 @@
-# PLAN — 开发计划与派单（v1，待审）
+# PLAN — 开发计划与派单（v2，按 AUDIT_2026-09-13-design 修订）
 
 > 流程纪律：方案审核（≥9.5）→ 分阶段开发（subagent）→ 每阶段审核（≥9.5）→ 收口。审核落盘 `docs/WORKLOG/AUDIT_YYYY-MM-DD-<主题>/`。
 
@@ -16,12 +16,12 @@
 ## P1 派单（dev subagent A）
 - **范围**：`plugin/**`、`tests/unit/`、`tests/integration/`、`scripts/`（含从 spike/ 迁移 install-plugin.mjs 为 `scripts/install-plugin.mjs`）。允许读 `sol-opencode/packages/core/**`、`docs/**`、`spike/**`。
 - **文件边界（可写）**：`plugin/`、`tests/unit/`、`tests/integration/`、`scripts/`。禁止改 `docs/`、`SoL-Pi/`、`sol-opencode/`、`zcode-plugins/`、`benchmark/`、`spike/`、`~/.zcode/**`（安装/配置观测动作只在明确要求的验证步骤执行，且只经 scripts/install-plugin.mjs）。
-- **开工首任务（配置闭环实证）**：① UI 保存一次 userConfig（或人工设置）观察 `~/.zcode/cli/config.json` 的 `plugins.options` 落盘键格式 → 回写结论到代码常量与 WORKLOG（不改 docs/，报回主控由主控回写 DESIGN §3/GOTCHAS）；② `--allowed-tools ""` 空白名单语义与 `--attach <file>` 附件进入上下文的方式实证（reducer 传输依据）。
+- **开工首任务（配置闭环实证）**：① 以实际 UI 保存样本复核 `plugins.options` 键格式（形状已实证见 GOTCHAS G19，复核 plugin-id 是否带 marketplace 后缀）→ 回写结论到 WORKLOG（不改 docs/，报回主控）；② `--disallowed-tools` 对内置工具全集与 mcp__ 前缀的覆盖实证（G18：--allowed-tools 是幻影不可用）；③ sol_* MCP 工具在宿主侧的调用 deadline 语义实证（无界则实现 600s 安全阀，n3）。
 - **必做**：
   1. vendor core：从 `sol-opencode/packages/core/src` 逐文件移植为 ESM `.mjs`（保留 NVIDIA 版权头 + plugin/THIRD_PARTY_NOTICES.md），类型擦除不改算法。
   2. manifest（userConfig 声明层）+ `.mcp.json`；**hooks 与 MCP 均直读 cli config.json 的 plugins.options**（DESIGN §3，缺省全关、非法回退 false、SOL_ZCODE_AUX 防重入）。
   3. hooks：`hooks/hooks.json`（7 事件挂单脚本，process 型）+ 配置解析 lib。
-  4. MCP server：握手按 GOTCHAS G11；工具 sol_write/sol_edit/sol_bash/obs_recall/sol_trajectory；五机制按 DESIGN §2；reducer 子进程=attach 传日志+空工具白名单+aux 标记；全部 fail-open。
+  4. MCP server：握手按 GOTCHAS G11；工具 sol_write/sol_edit/sol_bash/obs_recall/sol_trajectory；五机制按 DESIGN §2；reducer 子进程=**隔离 HOME（HOME env 重定向，仅 provider+model 的 cli config）+ --disallowed-tools 内置清单 + SOL_ZCODE_AUX 三层防护**、日志经 --attach；全部 fail-open。
   5. sol_write/sol_edit 变异语义等价测试组（vs 内置 Write/Edit：唯一匹配/replace_all/写前读/不存在路径等用例）。
   6. 证据存储 + hash 链账本（含 session-summary.json 终态锚点）+ `scripts/verify-evidence.mjs`。
   7. `tests/unit/`（core 断言等价移植）+ `tests/integration/`（MCP 握手/hook fixture/verify 篡改检测/全关零行为/aux 零行为）。

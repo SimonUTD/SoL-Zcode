@@ -40,10 +40,9 @@
 - **workaround（已验证有效）**：hook 以 **exit code 2** 退出 → 硬阻断，且 **stderr 文本会作为 reason 回传给模型**（模型明确复述了被拦与原因）。yolo 模式下也有效。
 - 影响：动作融合的"重定向门"必须用 exit-2 方案；exit-2 的 reason 走 stderr（上限 ~4KB）。
 
-## G9. SessionStart 的 additionalContext 注入确认可达模型（startup 源）
-- 事实：SessionStart hook 返回 `{"hookSpecificOutput":{hookEventName:"SessionStart",additionalContext:"SOLCTX9X7..."}}`，模型对"是否看到 SOLCTX9X7"回答 YES，且 rollout 请求体中出现 1 次。
-- 影响：opt-in 启用时的工具使用引导（让模型优先用 sol_write/sol_bash）走此通道。
-- 反例：UserPromptSubmit 的 additionalContext 一次实测模型称未见——但审核（运行时反编译）发现 `injectHookAdditionalContextIntoMessageHistory(on.UserPromptSubmit,…)` 是真实注入点（4 个调用点之一），矛盾**未决**，P2 复检后修正本条；当前设计不依赖该通道。
+## G9. SessionStart 与 UserPromptSubmit 的 additionalContext 注入均可达模型（初版反例已被 P2 e2e 推翻）
+- 事实：SessionStart(startup) 注入实测可达（SOLCTX9X7 实验）；**UserPromptSubmit 的 additionalContext 同样可达**（P2 s3 复检双证据：rollout `$.request.messages[5].content` 出现标记值 + 模型逐字回显 `G9MARK-<8hex>`；提示词只含格式不含值，无假阳性路径）。初版反例（模型自称未见）不成立，已修正。
+- 影响：opt-in 引导与 OCC 类提醒有两个可用注入通道。
 - ⚠️ **SessionStart(compact) 不存在**（审核 M1 反编译证据：runSessionStartHooks 仅 startup/resume 两个调用点；原生/手动压缩不触发任何 SessionStart hook；官方文档 matcher 表"startup|clear|compact"与 0.16.5 实际行为不符）。涉及压缩后事件的机制不得依赖此源。
 
 ## G10. UserPromptSubmit `continue:false` 阻断有效
@@ -61,12 +60,11 @@
 ## G13. Node hook 脚本不要 write 后立即 process.exit
 - 事实/惯例：管道 stdout 异步，`process.stdout.write` 后立刻 `process.exit(0)` 可能截断输出（G8 排查时先修掉的一个变量）。官方示例不 exit，自然结束。
 
-## G14. headless 会话的 rollout 计量文件会生成但不要依赖其完整性
-- 事实：headless 运行产生 `~/.zcode/cli/rollout/model-io-sess_<id>.jsonl`（含 request.body.messages/system/tools 与 response），但 `modelIoFullRetentionEnabled=false`（v2 setting.json）时留存策略不保证完整。
-- 影响：基准主计量用 G4 的 `--json` usage（provider 来源），rollout 只作对账/调试。
+## G14. headless 会话的 rollout 计量文件会生成且含完整 messages（P2 细化）
+- 事实：headless `--prompt` 的 rollout `model-io-sess_<id>.jsonl` **有** `request.messages`（full/delta 两种 kind；注意 messages 在 `request` 下而非 `request.body` 内），工具结果位于 role:"tool" 消息——可作为证据通道。留存策略受 `modelIoFullRetentionEnabled=false` 影响不保证长期完整；基准主计量仍用 G4 的 `--json` usage（provider 来源）。
 
 ## G15. 环境事实
-- Docker 由 OrbStack 提供（macOS）；代理 `127.0.0.1:7890`（git clone GitHub 需要时用）；gh 已认证 SimonUTD（repo 权限）。
+- Docker 由 OrbStack 提供（macOS）；代理 127.0.0.1:7890（git clone GitHub 需要时用）；gh 已认证 SimonUTD（repo 权限）。
 - 官方插件市场源码与规范：`zai-org/zcode-plugins`（已克隆到 `./zcode-plugins/`，文档 `docs/PLUGIN_DEVELOPMENT_CN.md`）。
 - 参考实现已克隆：`./SoL-Pi/`（上游）、`./sol-opencode/`（OpenCode 移植，core 包零依赖可 vendor）。
 
@@ -96,3 +94,16 @@
 - tool-rule 解析器另有别名规范化表（ApplyPatch→Write/Edit、SendMessage、ReadSessionContext、RespondToCoordinator、GoalRead、web_search、js 等）。
 - `--disallowed-tools` 匹配是纯名字集合成员测试，未知名 inert 不报错——枚举宁多勿漏（实现见 plugin/hooks/lib/reducer-subprocess.mjs BUILTIN_TOOL_NAMES，44 项=31 实名+10 别名+3 跨版本兼容，回归测试逐名钉死）。
 - 升级 zcode 版本时须重新反编译核对该清单（实现处已留复核指引）。
+
+## G21. 【OCC 关键】Stop 的 transcript_path 只含最后一条 assistant 消息（P2 e2e 实测）
+- 事实：0.16.5 headless 下 Stop hook 的 transcript 临时文件实测仅 94-114B（一条 assistant 消息），不是全对话。
+- 后果：任何依赖"读 transcript 估上下文/检测压缩"的设计结构性失效。OCC 压力检测必须改用**累积估算器**（hooks 能看到的输入逐次累加：PostToolUse 的 tool_response 字节数、UserPromptSubmit 的 prompt 长度、Stop 的 last_assistant_message 长度、OP 占位符替换量）。压缩检测在该数据源下不可实现（如实记录）。
+- 已驱动 plugin 修复（见 AUDIT_2026-09-13-p2-e2e）。
+
+## G22. headless CLI 改进程名为 zcode-cli，ps 嗅探找不到 zcode.cjs（P2 发现）
+- 事实：zcode.cjs 以 headless 方式运行后进程名显示为 `zcode-cli`，按 `zcode.cjs` 字样做 ps 嗅探定位二进制的逻辑会失败。
+- 影响：reducer 子进程定位宿主二进制需环境变量 `SOL_ZCODE_ZCODE_BIN` 显式覆盖（e2e/基准 harness 必须设置）；插件应有路径探测回退。
+
+## G23. 本机 APFS 卷（noowners）写文件 mode 位不可靠（P2 发现）
+- 事实：该卷上 `writeFile mode 0o755` 落地为 0644，需要执行位的文件必须显式 `chmod`。
+- 影响：任何生成可执行脚本的代码（e2e 种子、P3 容器挂载卷）都要显式 chmod。

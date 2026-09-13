@@ -85,7 +85,7 @@ sol_* 调用是配置使然，不是模型行为。
   `benchmark/assets/rl-watchdog.mjs` 与 `bin/test-rate-limit-guard.py`。历史数据
   不受影响："判据未触发"这一点可离线复算：
   `python3 rate_limit_guard.py probe/html-js-filter-20260913-235742/gate/sol-data.tgz`
-  → 最大请求间隙 1,896.8 s、streak 1/3。）
+  → 最大请求间隙 1,896.8 s、maxStreak=1/3（尾部 streak=0/3）。）
 - trajectory 记账小瑕疵：C 有 1 条 post_tool 无对应 pre_tool（首个 Bash），
   B 有 1 条 post 多于 pre（sol_write 8/7）；不影响调用计数结论。
 

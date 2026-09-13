@@ -53,7 +53,7 @@
 补充口径说明：
 
 - **USD** 为 pricing.py 按国际列表价折算（input $0.15 / output $0.50 / cacheRead $0.03 per 1M，2026-09-13 核对 Z.ai 官方），不是发票——实际消耗走 coding-plan 配额。审核已用 pricing.py 独立折算逐位吻合。
-- **墙钟噪声**：B/C 各遇 1 次 21–32 min 的 coding-plan 大请求通道瞬时节流（同窗口小请求 PONG 探针 1.1–1.3 s 正常返回，判定非臂内行为差异）；扣除节流后 B/C 真实工作时长分别 ≈40 / ≈28 min。节流期间"单请求 >10 min 连续 3 次"中止判据 streak 仅 1/3，未触发（现已代码化为 rl-watchdog，可离线复算：`python3 rate_limit_guard.py probe/html-js-filter-20260913-235742/gate/sol-data.tgz` → 最大请求间隙 1,896.8 s、streak 1/3）。
+- **墙钟噪声**：B/C 各遇 1 次 21–32 min 的 coding-plan 大请求通道瞬时节流（同窗口小请求 PONG 探针 1.1–1.3 s 正常返回，判定非臂内行为差异）；扣除节流后 B/C 真实工作时长分别 ≈40 / ≈28 min。节流期间"单请求 >10 min 连续 3 次"中止判据 streak 仅 1/3，未触发（现已代码化为 rl-watchdog，可离线复算：`python3 rate_limit_guard.py probe/html-js-filter-20260913-235742/gate/sol-data.tgz` → 最大请求间隙 1,896.8 s、maxStreak=1/3（尾部 streak=0/3））。
 - **数据源与被弃样本**：A 臂从被杀 runner 的 job 目录抢救（verifier 在 job 内判毕）；C 臂为本日干净重跑（harbor exit 0）。被弃用的历史 run（treatment run2/run3、限速污染的 gate run1）见 git 历史 81dfd7b/28e5188，不进对照；弃置处置经审核认定非挑选性（§3 复核 run2 支持遵从方差结论）。
 
 ## 3. 机制命中归因
@@ -157,7 +157,7 @@ P3 复审残留 MINOR-5（abort 主场景 ledger 不携带 `rateLimitAbort` 字�
 ## 附录 C：关键复算命令（无模型、无容器）
 
 ```bash
-# 限速判据离线复算（C 臂：最大请求间隙 1,896.8 s、streak 1/3 → 不中止）
+# 限速判据离线复算（C 臂：最大请求间隙 1,896.8 s、maxStreak=1/3（尾部 streak=0/3） → 不中止）
 python3 benchmark/rate_limit_guard.py benchmark/probe/html-js-filter-20260913-235742/gate/sol-data.tgz
 # USD 独立折算（与 usage.json 的 costUsd 逐位比对）
 python3 -c "from benchmark.pricing import cost_usd; print(cost_usd({'inputTokens':3505890,'cacheRead':3361920,'outputTokens':133157}))"

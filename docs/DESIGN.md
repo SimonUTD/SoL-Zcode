@@ -85,7 +85,8 @@ $ZCODE_PLUGIN_DATA/
 
 ### 2.4 在线上下文压缩（Online Context Compact）
 - **计划源**：原生 TodoWrite。PostToolUse(TodoWrite) hook 读 tool_input.todos → vendor core/plan（todosToPlan：cancelled 跳过、goal←content）→ analyzePlanTransition → 新完成步骤=**边界候选**（记录 pendingBoundary+progress 摘要+请求区间）。
-- **压力检测**：每次 Stop hook 估算上下文 tokens（读 transcript_path 消息，chars/4 估算 + system 长度；transcript 不可读则跳过本轮）→ 正增量滑窗(20)（sol-opencode 适配层常量，上游为累计均值——采用滑窗以适应长会话，记入偏差）→ vendor core/economics.decideCompaction（economics.ts 常量 1:1：memo=1000、keepRecent=20000、ratio=12.5、首次×2、后续×1.5+debt 门、windowReserve=16384；contextWindow=1,000,000 默认，若 SessionStart payload 含 model 字段（官方文档表列有，P1 实证）则优先取其值）。
+- **压力检测（P2.5 修订：累积估算器，G21）**：0.16.5 headless 下 Stop 的 transcript_path 只含最后一条 assistant 消息（G21），原"读 transcript 估上下文"结构性失明 → 改为**累积估算器**：occ-state 持久累计 cumulativeBytes（数据源=hooks 可见的全部输入：PostToolUse 的 tool_response 字节数（优先 stdoutBytes+stderrBytes）、UserPromptSubmit 的 prompt 字节、Stop 的 last_assistant_message 字节）+ SYSTEM_BASELINE_TOKENS=12000 基线，tokens=bytes/4；contextTotal=max(累计+基线, transcript 估计)（全量 transcript 宿主下取更优信号）。正增量滑窗(20)（sol-opencode 适配层常量）→ vendor core/economics.decideCompaction（economics.ts 常量 1:1：memo=1000、keepRecent=20000、ratio=12.5、首次×2、后续×1.5+debt 门、windowReserve=16384；contextWindow 默认 1,000,000，可经 SOL_ZCODE_OCC_WINDOW_TOKENS env 注入用于测试）。真实 1M 窗口下经济触发经 e2e 验证可达（s5 v5：累计 228KB/69k tokens 触发 stop-block-economic，自限连续≤2）。
+- **压缩检测（G21 降级声明）**：累积估算器看不到被压缩掉的历史 → 压缩事后检测在 0.16.5 headless **不可用**（occ-state 如实记 compactionDetection:"unavailable"，检测代码路径保留；宿主未来提供全量 transcript 或压缩事件时按判据 entries≥2 && transcript.tokens≥estimated 自动恢复）。
 - **动作通道（修订 M1/M2；Zcode API 现实下的等价实现）**：
   1. **经济性建议**：decision.compact=true 时，Stop hook 返回 `{"decision":"block","reason":"[sol-occ] …"}`——block 是 Stop additionalContext 唯一可达模型的形态（运行时注入仅在 shouldContinueAfterStopHooks 分支，审核 M2 证据）；reason 文案="boundary reached; compaction is now economical (est. saving X tokens). Continue the current task lean; avoid re-reading large outputs (use obs_recall)."。**自限**：状态机记录连续 block 次数，本插件最多连续 2 次（宿主上限 3，留 1 次余量）；每会话 block 总数上限 3 次（对齐 sol-opencode maxAutoContinuations=3 语义）。block 产生的续跑轮次成本如实计入基准。
   2. **原生 autoCompact 兜底窗口保护**：运行时存在 autoCompactIfNeeded/autoCompactThreshold（审核 §3-6 佐证），窗口压力最终由宿主处理——插件不重复触发（C4：运行时决策归宿主/harness）。
@@ -153,5 +154,5 @@ $ZCODE_PLUGIN_DATA/
 6. `--max-turns` 损坏（G3）→ 基准靠 prompt 协议与超时控制。
 7. **sol_write/sol_edit 变异为自实现**（内置 execute 不可复用）：old_string 唯一匹配、read-before-write 等语义须逐项复刻并以等价测试组钉死（P1）——本方案最大重写点。
 8. **sol_bash/then_run 命令由 MCP server 子进程直接执行**，不经宿主 Bash 的权限审批/沙箱/30000 字符截断/持久化输出治理链（§2.1 C4 表述）；MCP 工具调用本身受宿主权限系统管辖（各 mode 行为 P1 实测写明）。
-9. 压缩检测靠 transcript 前后对比（启发式，M1 修复），非宿主事件；误判方向为"漏报"（不提醒），不影响正确性。
+9. 压缩检测在 0.16.5 headless 不可用（G21：Stop transcript 仅含末条 assistant 消息；occ-state 如实记 unavailable，不造假）；压力检测用累积估算器（hooks 可见输入逐次累加，见 §2.4）。
 10. 上下文 token 估算为 chars/4 + 滑窗(20)（sol-opencode 适配层做法，上游为累计均值）——经济学决策的输入是估算值。

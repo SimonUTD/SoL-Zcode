@@ -16,7 +16,14 @@ Design (docs/DESIGN.md §7, docs/RESEARCH/terminal-bench-4.md §4):
              (G3/G18: --max-turns/--allowed-tools are broken; timeout is the
              trial-level agent timeout plus an in-band `timeout` cap), with
              SOL_ZCODE_ZCODE_BIN pinned (G22 — headless zcode renames its
-             process, ps-sniffing fails).
+             process, ps-sniffing fails). The agent is wrapped by
+             rl-watchdog.mjs (audit MAJOR-1): 3 consecutive model requests
+             each > RL_ABORT_SEC observed from the plugin trajectory ->
+             kill the process group + RateLimitDegeneracyError, so the trial
+             is booked as errored instead of silently burning the cap.
+             Blind/fail-open on arms with trajectory=false (no observation
+             source). The watchdog runs inside the container, independent
+             of the host runner.
   populate_context_post_run()  parse the captured --json (G4 usage block:
              inputTokens includes cached tokens) back into AgentContext.
 
@@ -46,6 +53,7 @@ from typing import Any, override
 from harbor.agents.capabilities import AgentCapabilities
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
+    NonZeroAgentExitCodeError,
     with_prompt_template,
 )
 from harbor.environments.base import BaseEnvironment
@@ -62,6 +70,10 @@ from bench_config import (  # noqa: E402
     DEFAULT_ZCODE_CJS,
     MARKETPLACE,
     PLUGIN_ID,
+    RL_ABORT_MARKER,
+    RL_ABORT_SEC,
+    RL_CONSECUTIVE,
+    RL_POLL_SEC,
     SELF_CAP_SEC,
 )
 from pricing import cost_usd  # noqa: E402
@@ -69,6 +81,17 @@ from pricing import cost_usd  # noqa: E402
 REPO_ROOT = BENCH_ROOT.parent
 
 _bundle_path: str | None = None
+
+
+class RateLimitDegeneracyError(NonZeroAgentExitCodeError):
+    """Audit MAJOR-1: 3 consecutive model requests each > RL_ABORT_SEC.
+
+    Raised after the in-container watchdog (assets/rl-watchdog.mjs) kills the
+    agent process group. Subclassing NonZeroAgentExitCodeError keeps Harbor's
+    timeout accounting path: the trial is recorded with exceptionType
+    "RateLimitDegeneracyError" and the verifier still runs, so the ledger
+    shows the true cause instead of a silent burn to the in-band cap.
+    """
 
 
 def _host_api_key() -> str | None:
@@ -127,6 +150,9 @@ def build_bundle() -> str:
         tar.add(REPO_ROOT / "scripts" / "install-plugin.mjs", arcname="install-plugin.mjs")
         tar.add(BENCH_ROOT / "assets" / "provider-template.json", arcname="provider-template.json")
         tar.add(BENCH_ROOT / "assets" / "write-cli-config.mjs", arcname="write-cli-config.mjs")
+        # Bench infra (not freeze-hashed, same as write-cli-config.mjs): the
+        # in-container rate-limit watchdog wrapped around the agent by run().
+        tar.add(BENCH_ROOT / "assets" / "rl-watchdog.mjs", arcname="rl-watchdog.mjs")
         node_dir = BENCH_ROOT / "assets" / "node"
         if node_dir.is_dir():
             for tarball in sorted(node_dir.glob("node-v*-linux-*.tar.xz")):
@@ -327,6 +353,14 @@ node --version
         if collect:
             env["SOL_BENCH_COLLECT_EVIDENCE"] = collect
         logs_dir = self.environment_logs_dir.as_posix()
+        agent_cmd = (
+            # In-band cap: produces exit 124 + stderr instead of a
+            # container-level kill; Harbor's trial timeout (task.toml
+            # 8h) is the outer backstop.
+            f"timeout {SELF_CAP_SEC}s node {CONTAINER_ROOT}/zcode.cjs "
+            f"--prompt {escaped} --mode yolo --json "
+            f"2>&1 </dev/null"
+        )
         try:
             await self.exec_as_agent(
                 environment,
@@ -337,15 +371,34 @@ node --version
                     # install() — including for plugin hook/MCP subprocesses.
                     f'[ -n "${{SOL_BENCH_WORKDIR:-}}" ] && cd "$SOL_BENCH_WORKDIR"; '
                     f"mkdir -p {logs_dir} && "
-                    # In-band cap: produces exit 124 + stderr instead of a
-                    # container-level kill; Harbor's trial timeout (task.toml
-                    # 8h) is the outer backstop.
-                    f"timeout {SELF_CAP_SEC}s node {CONTAINER_ROOT}/zcode.cjs "
-                    f"--prompt {escaped} --mode yolo --json "
-                    f"2>&1 </dev/null | tee {logs_dir}/{self._OUTPUT_FILENAME}"
+                    # rl-watchdog (audit MAJOR-1): wraps the agent in its own
+                    # process group, tees combined stdout+stderr to zcode.txt
+                    # (and this exec's stdout), and kills the group when
+                    # RL_CONSECUTIVE consecutive model requests each exceed
+                    # RL_ABORT_SEC (observed from the plugin trajectory), then
+                    # exits 75 with the marker written next to zcode.txt.
+                    f"node {CONTAINER_ROOT}/rl-watchdog.mjs "
+                    f"--out {logs_dir}/{self._OUTPUT_FILENAME} "
+                    f"--abort-marker {logs_dir}/{RL_ABORT_MARKER} "
+                    f"--abort-sec {RL_ABORT_SEC} --consecutive {RL_CONSECUTIVE} "
+                    f"--poll-sec {RL_POLL_SEC} "
+                    f"-- {shlex.quote(agent_cmd)}"
                 ),
                 env=env,
             )
+        except RuntimeError as exc:
+            # harbor's _exec raises NonZeroAgentExitCodeError (a RuntimeError)
+            # on nonzero exit. If the watchdog fired (exit 75 + marker),
+            # re-raise as the distinctive type so the ledger books the true
+            # cause; otherwise propagate untouched (exit 124 stays 124).
+            abort = self._read_abort_marker()
+            if abort is not None:
+                raise RateLimitDegeneracyError(_abort_detail(abort)) from exc
+            raise
+        else:
+            abort = self._read_abort_marker()
+            if abort is not None:
+                raise RateLimitDegeneracyError(_abort_detail(abort))
         finally:
             self._run_finished = time.monotonic()
             if collect:
@@ -366,6 +419,16 @@ node --version
             )
         except Exception:  # noqa: BLE001 — evidence collection is best-effort
             self.logger.warning("plugin evidence collection failed", exc_info=True)
+
+    def _read_abort_marker(self) -> dict[str, Any] | None:
+        """Watchdog abort marker from the (bind-mounted) logs dir, validated."""
+        try:
+            data = json.loads((self.logs_dir / RL_ABORT_MARKER).read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(data, dict) and data.get("reason") == "rate-limit-degeneracy":
+            return data
+        return None
 
     # -------------------------------------------------- populate_context_post_run
     @override
@@ -419,7 +482,33 @@ node --version
             responsePreview=(payload.get("response") or "")[:400] or None,
             contextWindow=payload.get("projection", {}).get("contextWindow"),
         )
+        abort_marker = self._read_abort_marker()
+        if abort_marker is not None:
+            # Lift the watchdog's own evidence (gap list) into the trial
+            # metadata so the ledger line carries the abort cause verbatim.
+            meta["rateLimitAbort"] = {
+                "reason": abort_marker.get("reason"),
+                "abortSec": abort_marker.get("abortSec"),
+                "consecutive": abort_marker.get("consecutive"),
+                "ts": abort_marker.get("ts"),
+                "evidence": (abort_marker.get("verdict") or {}).get("evidence"),
+            }
         context.metadata = {"zcode": meta}
+
+
+def _abort_detail(marker: dict[str, Any]) -> str:
+    verdict = marker.get("verdict") or {}
+    gaps = ", ".join(
+        f"{g.get('seconds')}s{' (in flight)' if g.get('pending') else ''}"
+        for g in (verdict.get("evidence") or [])
+    )
+    return (
+        f"rate-limit degeneracy: {verdict.get('streak')} consecutive model "
+        f"request(s) each > {marker.get('abortSec')}s "
+        f"(abort-sec {marker.get('abortSec')} x {marker.get('consecutive')}); "
+        f"observed gaps: {gaps or 'n/a'}; "
+        f"trajectory: {marker.get('trajectoryFile')}"
+    )
 
 
 def _parse_headless_json(text: str) -> dict[str, Any] | None:

@@ -45,6 +45,7 @@ from bench_config import (  # noqa: E402
     DEFAULT_ZCODE_CJS,
     MARKETPLACE,
     PLUGIN_ID,
+    RL_ABORT_MARKER,
 )
 from pricing import cost_usd  # noqa: E402
 
@@ -340,6 +341,10 @@ def parse_job_dir(job_dir: Path) -> list[dict[str, Any]]:
                 "wallMs": wall_ms or meta.get("agentWallMs"),
             }
         )
+        # Rate-limit degeneracy abort (audit MAJOR-1): carry the watchdog's
+        # own evidence into the ledger line when it fired.
+        if meta.get("rateLimitAbort"):
+            trials[-1]["rateLimitAbort"] = meta["rateLimitAbort"]
     return trials
 
 
@@ -443,7 +448,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         arm = trial["arm"]
         arm_out = out_dir / arm
         arm_out.mkdir(parents=True, exist_ok=True)
-        for name in ("zcode.txt", "sol-data.tgz", "trajectory.json"):
+        for name in ("zcode.txt", "sol-data.tgz", "trajectory.json", RL_ABORT_MARKER):
             src = trial_dir / "agent" / name
             if src.exists():
                 (arm_out / name).write_bytes(src.read_bytes())

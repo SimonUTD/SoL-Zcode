@@ -25,6 +25,22 @@ DEFAULT_MODEL = "builtin:bigmodel-coding-plan/GLM-5.3-Flash"
 # [agent] timeout_sec = 28800 for every TB 4.0 task).
 SELF_CAP_SEC = int(os.environ.get("SOL_BENCH_AGENT_CAP_SEC", "28800"))
 
+# Rate-limit degeneracy abort criterion (audit MAJOR-1, implemented 2026-09-14):
+# a single model request OBSERVED to take > RL_ABORT_SEC, RL_CONSECUTIVE times
+# in a row -> abort the trial (exceptionType=RateLimitDegeneracyError) instead
+# of silently burning wall/quota until the in-band cap. Observation source is
+# the plugin trajectory JSONL (see rate_limit_guard.py); the in-flight request
+# counts as soon as it crosses the threshold, so a fully hung third request
+# still aborts. Enforced in-container by assets/rl-watchdog.mjs — it does not
+# depend on the host runner being alive. Arms with trajectory=false (control)
+# write no trajectory and run watchdog-blind (fail-open, cap only).
+RL_ABORT_SEC = int(os.environ.get("SOL_BENCH_RL_ABORT_SEC", "600"))
+RL_CONSECUTIVE = int(os.environ.get("SOL_BENCH_RL_CONSECUTIVE", "3"))
+RL_POLL_SEC = int(os.environ.get("SOL_BENCH_RL_POLL_SEC", "30"))
+# Written next to zcode.txt by the watchdog when it aborts; lifted into the
+# ledger line by run.py (parse_job_dir) as evidence.
+RL_ABORT_MARKER = "zcode.txt.rl-abort.json"
+
 ARM_OPTIONS: dict[str, dict[str, Any]] = {
     # control: plugin installed but every mechanism off (zero behavior, C2)
     "control": {

@@ -1,18 +1,20 @@
 /*
  * S5B — Stop-block delivery channel proof (G17), real host + real model.
  *
- * S5 established (honest negative, see its recorded result) that the OCC
- * economic trigger cannot fire in real zcode 0.16.5 headless sessions: the
- * Stop transcript carries only the last assistant message, so the estimator
- * never sees conversation-scale context, and the giant-final-message
- * workaround exceeds feasible generation time (3 real attempts, 420-690 s).
+ * History: S5 v4 established (honest negative, see the recorded v4 result)
+ * that the transcript-based OCC estimator could not fire in real zcode 0.16.5
+ * headless sessions. The P2.5 fix (G21 cumulative estimator) closed that gap —
+ * S5 v5 now triggers the economic block end-to-end in a real session — so this
+ * scenario's role is deliberately narrower and orthogonal to the estimator: it
+ * proves the CHANNEL itself in isolation, with the probe plugin (fixture, not
+ * sol-zcode) emitting the block, so channel failures can never be conflated
+ * with estimator behavior.
  *
- * What remains to prove end-to-end is the CHANNEL itself — the only part of
- * the OCC action path the host actually offers: a Stop hook returning
- * {"decision":"block","reason":...} must (a) make the host CONTINUE the turn,
- * (b) re-run Stop with stop_hook_active=true, and (c) deliver the reason text
- * into the model's request context (the model can only complete its
- * instructed reaction if it received the reason).
+ * What it proves: a Stop hook returning {"decision":"block","reason":...}
+ * must (a) make the host CONTINUE the turn, (b) re-run Stop with
+ * stop_hook_active=true, and (c) deliver the reason text into the model's
+ * request context (the model can only complete its instructed reaction if it
+ * received the reason).
  *
  * Method: the e2e probe plugin (fixture, not sol-zcode) emits a one-shot
  * decision:block on the FIRST Stop of a fresh session; the prompt instructs

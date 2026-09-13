@@ -18,7 +18,14 @@
 import { readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { resolveConfig } from "./lib/config.mjs";
-import { observeTranscript, runOccCorrection, runOccStopRound, runOccTodoBoundary } from "./lib/occ.mjs";
+import {
+	accumulateOccUsage,
+	observeTranscript,
+	resolveContextWindowTokens,
+	runOccCorrection,
+	runOccStopRound,
+	runOccTodoBoundary,
+} from "./lib/occ.mjs";
 import {
 	appendTrajectory,
 	dataRoot,
@@ -255,6 +262,9 @@ async function handleEvent(payload, cfg) {
 		case "UserPromptSubmit": {
 			if (cfg.onlineCompact) {
 				const prompt = str(payload.prompt) ?? "";
+				// G21 cumulative estimator: the submitted prompt enters the model
+				// context verbatim — count its bytes.
+				await accumulateOccUsage(root, sessionId, Buffer.byteLength(prompt, "utf8"), "prompt");
 				if (prompt.startsWith("CORRECTION:")) {
 					await runOccCorrection(root, sessionId);
 				}
@@ -277,10 +287,25 @@ async function handleEvent(payload, cfg) {
 			if (extracted !== undefined) {
 				await archiveNativeObservation(root, sessionId, toolName, extracted, cfg);
 			}
-			if (cfg.onlineCompact && toolName === "TodoWrite") {
-				const todos = toolInput && typeof toolInput === "object" ? toolInput.todos : undefined;
-				if (Array.isArray(todos)) {
-					await runOccTodoBoundary(root, sessionId, todos);
+			if (cfg.onlineCompact) {
+				// G21 cumulative estimator: count the tool-result volume the
+				// payload reports (stdout+stderr byte fields preferred, else the
+				// delivered strings / structured response size — what the host
+				// actually hands the model). For the plugin's own MCP tools the
+				// response IS the placeholder the model sees, so no
+				// removedTokens adjustment is needed: the archived full output
+				// never enters the context. Native Bash large outputs are
+				// conservative in the over-count direction (full stdoutBytes vs
+				// the ~2KB preview the model keeps, G7).
+				const usageBytes = occToolResponseBytes(toolResponse);
+				if (usageBytes > 0) {
+					await accumulateOccUsage(root, sessionId, usageBytes, `tool:${toolName ?? "native"}`);
+				}
+				if (toolName === "TodoWrite") {
+					const todos = toolInput && typeof toolInput === "object" ? toolInput.todos : undefined;
+					if (Array.isArray(todos)) {
+						await runOccTodoBoundary(root, sessionId, todos);
+					}
 				}
 			}
 			return null;
@@ -293,11 +318,27 @@ async function handleEvent(payload, cfg) {
 			if (cfg.onlineCompact) {
 				const observation = await observeTranscript(str(pick(payload, "transcript_path", "transcriptPath")));
 				const stopHookActive = pick(payload, "stop_hook_active", "stopHookActive") === true;
+				// G21 cumulative estimator feed: the final assistant message is
+				// the one assistant output hooks ever see. Use the payload field
+				// (0.16.5 Stop payloads carry last_assistant_message, S3 probe);
+				// when absent and the transcript is last-message-only (entries
+				// ≤2), fall back to its byte size.
+				const lastAssistant = str(pick(payload, "last_assistant_message", "lastAssistantMessage"));
+				const assistantBytes =
+					lastAssistant !== undefined
+						? Buffer.byteLength(lastAssistant, "utf8")
+						: observation !== null && observation.entries <= 2
+							? observation.bytes
+							: 0;
 				const result = await runOccStopRound(root, sessionId, {
 					observation,
 					stopHookActive,
 					model,
-					contextWindowTokens: numericContextWindow(payload),
+					contextWindowTokens: resolveContextWindowTokens({
+						payloadWindow: numericContextWindow(payload),
+						env: process.env,
+					}),
+					assistantBytes,
 				});
 				await refreshSessionSummary(root, sessionId).catch(() => undefined);
 				if (result.block !== null) {
@@ -327,6 +368,25 @@ function nativeBytes(payload) {
 	}
 	if (typeof tr === "string") return Buffer.byteLength(tr, "utf8");
 	return undefined;
+}
+
+/**
+ * G21 cumulative estimator input: the tool-result byte volume as reported by
+ * the PostToolUse payload — byte fields first (stdoutBytes+stderrBytes carry
+ * the FULL output even when the payload stdout is truncated to 30000 chars,
+ * G6), then the delivered stdout string, then the stringified structured
+ * response (e.g. non-Bash tools). Same accounting as the trajectory byte
+ * fields (nativeBytes), extended for structured non-Bash responses.
+ */
+function occToolResponseBytes(toolResponse) {
+	const native = nativeBytes({ tool_response: toolResponse });
+	if (typeof native === "number") return native;
+	if (toolResponse === undefined || toolResponse === null) return 0;
+	try {
+		return Buffer.byteLength(JSON.stringify(toolResponse), "utf8");
+	} catch {
+		return 0;
+	}
 }
 
 async function main() {

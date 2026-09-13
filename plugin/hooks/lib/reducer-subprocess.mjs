@@ -25,12 +25,16 @@
  *
  * The host binary path is resolved WITHOUT hardcoding: ① env
  * SOL_ZCODE_ZCODE_BIN override, ② sniffing the parent process argv for the
- * zcode.cjs entry (hooks/MCP are children of the host). Missing binary →
- * fail-open fallback reason.
+ * zcode.cjs entry (hooks/MCP are children of the host), ③ probing known
+ * install locations (G22: headless zcode.cjs renames its process to
+ * "zcode-cli", so the ps sniff structurally fails under `node zcode.cjs
+ * --prompt`; the documented install path from GOTCHAS G1 is the only
+ * executable entry). All probes miss → fail-open fallback reason.
  */
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -109,9 +113,27 @@ export const BUILTIN_TOOL_NAMES = [
 	"Memory",
 ];
 
-/** Resolve the zcode entry point without hardcoding an install path. */
-export function resolveZcodeBin(env = process.env) {
-	if (env.SOL_ZCODE_ZCODE_BIN && env.SOL_ZCODE_ZCODE_BIN.length > 0) return env.SOL_ZCODE_ZCODE_BIN;
+/**
+ * Known zcode install locations probed after env override and ps sniffing both
+ * fail (G22). G1: the app-bundled zcode.cjs is the only executable entry; the
+ * per-user Applications dir is probed first (admin-less installs), then the
+ * machine-wide /Applications.
+ */
+export const KNOWN_ZCODE_BIN_PATHS = [
+	join(homedir(), "Applications", "ZCode.app", "Contents", "Resources", "glm", "zcode.cjs"),
+	"/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+];
+
+function isRegularFileSync(path) {
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
+}
+
+/** ps sniff: walk the parent process argv for the zcode entry (up to 5 hops). */
+export function sniffZcodeBinFromProcessTree() {
 	let pid = process.ppid;
 	for (let depth = 0; depth < 5 && pid > 1; depth += 1) {
 		const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
@@ -130,6 +152,28 @@ export function resolveZcodeBin(env = process.env) {
 		const next = parent.status === 0 ? parseInt((parent.stdout || "").trim(), 10) : NaN;
 		if (!Number.isFinite(next) || next <= 1) break;
 		pid = next;
+	}
+	return null;
+}
+
+/**
+ * Resolve the zcode entry point without hardcoding an install path.
+ * Order: SOL_ZCODE_ZCODE_BIN env → parent-process ps sniff → known install
+ * locations (G22) → null (fail-open). probePaths/fileExists/sniff are
+ * injectable for tests.
+ */
+export function resolveZcodeBin(
+	env = process.env,
+	{ probePaths = KNOWN_ZCODE_BIN_PATHS, fileExists = isRegularFileSync, sniff = sniffZcodeBinFromProcessTree } = {},
+) {
+	if (env.SOL_ZCODE_ZCODE_BIN && env.SOL_ZCODE_ZCODE_BIN.length > 0) return env.SOL_ZCODE_ZCODE_BIN;
+	const sniffed = sniff();
+	if (typeof sniffed === "string" && sniffed.length > 0) return sniffed;
+	// G22 fallback: headless hosts rename the process (zcode-cli), so ps
+	// sniffing cannot see the entry script. Probe known install locations
+	// before giving up (fail-open).
+	for (const candidate of probePaths) {
+		if (typeof candidate === "string" && candidate.length > 0 && fileExists(candidate)) return candidate;
 	}
 	return null;
 }

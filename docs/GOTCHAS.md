@@ -98,7 +98,7 @@
 ## G21. 【OCC 关键】Stop 的 transcript_path 只含最后一条 assistant 消息（P2 e2e 实测）
 - 事实：0.16.5 headless 下 Stop hook 的 transcript 临时文件实测仅 94-114B（一条 assistant 消息），不是全对话。
 - 后果：任何依赖"读 transcript 估上下文/检测压缩"的设计结构性失效。OCC 压力检测必须改用**累积估算器**（hooks 能看到的输入逐次累加：PostToolUse 的 tool_response 字节数、UserPromptSubmit 的 prompt 长度、Stop 的 last_assistant_message 长度、OP 占位符替换量）。压缩检测在该数据源下不可实现（如实记录）。
-- 已驱动 plugin 修复（见 AUDIT_2026-09-13-p2-e2e）。
+- **已修复（P2.5）**：压力检测改为累积估算器（occ-state 累计 hooks 可见输入 + 12k 基线），真实 1M 窗口经济触发 e2e 验证可达；压缩检测如实降级为 unavailable（检测代码保留，宿主提供全量 transcript 时自动恢复）。
 
 ## G22. headless CLI 改进程名为 zcode-cli，ps 嗅探找不到 zcode.cjs（P2 发现）
 - 事实：zcode.cjs 以 headless 方式运行后进程名显示为 `zcode-cli`，按 `zcode.cjs` 字样做 ps 嗅探定位二进制的逻辑会失败。

@@ -9,9 +9,22 @@
  *     (the only Stop output shape that reaches the model, G17);
  *   - compaction detection → transcript observation delta (entries drop ≥30%
  *     in the same session), reminder delivered on the NEXT Stop via the same
- *     block channel (DESIGN §2.4 action 3);
+ *     block channel (DESIGN §2.4 action 3). Under the cumulative estimator the
+ *     Stop transcript in zcode 0.16.5 carries ONLY the last assistant message
+ *     (G21), so the drop detector is honestly recorded as "unavailable" until
+ *     a host provides a full-conversation transcript again;
  *   - self-limits: at most 2 consecutive blocks (host cap 3, one spare) and at
  *     most 3 blocks per session (upstream maxAutoContinuations=3 semantics).
+ *
+ * Pressure estimation is a CUMULATIVE estimator (G21 redesign): the Stop-time
+ * transcript is structurally last-message-only in 0.16.5 headless, so context
+ * pressure is estimated by accumulating every context volume the hooks CAN see
+ * — UserPromptSubmit prompt bytes, PostToolUse tool_response bytes (stdout+
+ * stderr byte fields, or the structured response size), Stop
+ * last_assistant_message bytes — into occ-state (cumulativeBytes /
+ * estimatedTokens, tokens = bytes/4). writeTokens = cumulative estimate + a
+ * fixed system-prompt baseline. Known blind spot (underestimate, never
+ * fabricated): assistant tool-call turns are not hook-visible.
  *
  * State: occ-state.json snapshot; every mutation first appends the full new
  * state to occ-history.jsonl (hash-chained).
@@ -33,6 +46,14 @@ export const MAX_CONSECUTIVE_BLOCKS = 2;
 export const MAX_SESSION_BLOCKS = 3;
 export const COMPACTION_DROP_RATIO = 0.3;
 
+// Cumulative estimator constants (G21 redesign; DESIGN §2.4 "chars/4 估算 +
+// system 长度"). CHARS_PER_TOKEN mirrors the vendor observation-pack constant.
+export const CHARS_PER_TOKEN = 4;
+// Fixed stand-in for the host system prompt + tool-schema overhead that hooks
+// cannot read: a minimal headless session already reports ~12.7k contextUsed
+// (P2 s3 probe, projection.contextUsed=12762 for a near-empty prompt).
+export const SYSTEM_BASELINE_TOKENS = 12_000;
+
 const OCC_STATE_SCHEMA = "sol_zcode_online_context_compact/1";
 
 export function initialOccState() {
@@ -46,6 +67,9 @@ export function initialOccState() {
 		completedBoundaryRequestCounts: [],
 		increments: [],
 		lastContextTokens: 0,
+		cumulativeBytes: 0,
+		estimatedTokens: 0,
+		compactionDetection: "unknown",
 		priorCompactionCount: 0,
 		carriedDebtTokens: 0,
 		cacheDebtRepaymentTokens: 0,
@@ -79,6 +103,37 @@ export async function persistOccState(dataRoot, sessionId, state, reason) {
 	const tmp = `${occStatePath(dataRoot, sessionId)}.tmp-${process.pid}`;
 	await writeFile(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
 	await rename(tmp, occStatePath(dataRoot, sessionId));
+}
+
+/**
+ * Cumulative estimator feed (G21): add one hook-visible context volume —
+ * UserPromptSubmit prompt bytes, PostToolUse tool_response bytes, Stop
+ * last_assistant_message bytes — to occ-state. Hooks are separate processes;
+ * occ-state.json is the shared blackboard, so every event loads→adds→persists.
+ * tokens = bytes/4 (CHARS_PER_TOKEN, same convention as the vendor
+ * observation pack).
+ */
+export async function accumulateOccUsage(dataRoot, sessionId, bytes, kind) {
+	const state = await loadOccState(dataRoot, sessionId);
+	const add = Number.isFinite(bytes) ? Math.max(0, Math.floor(bytes)) : 0;
+	state.cumulativeBytes += add;
+	state.estimatedTokens = Math.ceil(state.cumulativeBytes / CHARS_PER_TOKEN);
+	await persistOccState(dataRoot, sessionId, state, `usage:${typeof kind === "string" && kind.length > 0 ? kind : "event"}`);
+	return state;
+}
+
+/**
+ * Effective context window resolution order: host payload field (absent in
+ * 0.16.5, S3 probe) → SOL_ZCODE_OCC_WINDOW_TOKENS env → caller keeps the
+ * persisted/default value. The env knob is the sanctioned injection point for
+ * reduced-window simulations in tests/e2e (thresholds and window constants
+ * themselves are never edited).
+ */
+export function resolveContextWindowTokens({ payloadWindow, env = process.env } = {}) {
+	if (Number.isFinite(payloadWindow) && payloadWindow > 0) return Math.floor(payloadWindow);
+	const fromEnv = Number(env.SOL_ZCODE_OCC_WINDOW_TOKENS);
+	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
+	return undefined;
 }
 
 /**
@@ -124,7 +179,10 @@ export function todosToPlan(todos) {
 
 /**
  * Observe a transcript JSONL: { entries, bytes, tokens } or null when the
- * transcript cannot be read (callers skip the OCC round entirely — fail-open).
+ * transcript cannot be read. Secondary signal since the G21 redesign (in
+ * 0.16.5 headless the Stop transcript carries only the last assistant
+ * message): it feeds the max() context estimate, the compaction-detection
+ * availability rule and the transcriptSnapshot diagnostics.
  * Token estimate: chars/4 over text-bearing string fields (sol-opencode
  * adapter approach; an estimate by design, DESIGN §8.10).
  */
@@ -148,7 +206,7 @@ export async function observeTranscript(transcriptPath) {
 		chars += countTextChars(obj, undefined, 0);
 	}
 	// chars/4 estimate computed without materializing a padding string.
-	const tokens = Math.ceil(chars / 4);
+	const tokens = Math.ceil(chars / CHARS_PER_TOKEN);
 	return { entries: lines.length, bytes: Buffer.byteLength(raw, "utf8"), tokens };
 }
 
@@ -180,8 +238,19 @@ function average(values) {
 /**
  * Stop-round OCC processing. Mutates and persists the state; returns
  * { block: null | { reason } , decision } for the hook envelope.
+ *
+ * G21 cumulative estimator: `assistantBytes` (the Stop payload's
+ * last_assistant_message byte length, falling back to the transcript byte size
+ * when that transcript is last-message-only) is accumulated FIRST; the context
+ * estimate is then max(cumulative + system baseline, transcript estimate) —
+ * the transcript only wins on a host that provides a full-conversation
+ * transcript, where it is the strictly better signal.
  */
-export async function runOccStopRound(dataRoot, sessionId, { observation, stopHookActive, model, contextWindowTokens }) {
+export async function runOccStopRound(
+	dataRoot,
+	sessionId,
+	{ observation, stopHookActive, model, contextWindowTokens, assistantBytes = 0 },
+) {
 	const state = await loadOccState(dataRoot, sessionId);
 
 	if (typeof model === "string" && model.length > 0) state.model = model;
@@ -192,16 +261,43 @@ export async function runOccStopRound(dataRoot, sessionId, { observation, stopHo
 	// A Stop that was not itself caused by our block resets the consecutive counter.
 	if (stopHookActive !== true) state.consecutiveBlocks = 0;
 
-	if (observation === null) {
-		// Transcript unreadable → skip this round entirely (fail-open).
-		await persistOccState(dataRoot, sessionId, state, "stop-transcript-unavailable");
+	if (observation === null && !(assistantBytes > 0)) {
+		// No signal at all (no transcript, no assistant message) → skip this
+		// round entirely (fail-open). A readable transcript alone or any
+		// accumulated usage is enough to proceed.
+		await persistOccState(dataRoot, sessionId, state, "stop-observation-unavailable");
 		return { block: null, decision: null, state };
 	}
+
+	if (assistantBytes > 0) {
+		state.cumulativeBytes += Math.floor(assistantBytes);
+		state.estimatedTokens = Math.ceil(state.cumulativeBytes / CHARS_PER_TOKEN);
+	}
+
+	// Context estimate: cumulative hook-visible volume + fixed system baseline,
+	// never below the transcript estimate when one is readable.
+	const cumulativeTotal = state.estimatedTokens + SYSTEM_BASELINE_TOKENS;
+	const contextTotal = observation === null ? cumulativeTotal : Math.max(cumulativeTotal, observation.tokens);
+
+	// Compaction detection availability (G21): the entries-drop detector needs a
+	// full-conversation transcript. In 0.16.5 headless the Stop transcript is
+	// structurally last-message-only (entries pinned at 1, token estimate ≪ the
+	// accumulated conversation), so the detector would be silently blind — it is
+	// honestly recorded as "unavailable" instead of pretending to watch. A
+	// transcript that plausibly covers the whole conversation (≥2 entries and at
+	// least as many estimated tokens as the hook-side accumulation) re-arms the
+	// detector. DESIGN §2.4 deviation; see GOTCHAS G21.
+	const detectionAvailable =
+		observation !== null &&
+		observation.entries >= 2 &&
+		observation.tokens >= state.estimatedTokens;
+	state.compactionDetection = detectionAvailable ? "available" : "unavailable";
 
 	// Compaction detection: entries dropped ≥30% within the same session.
 	const previousSnapshot = state.transcriptSnapshot;
 	let compactionDetected = false;
 	if (
+		detectionAvailable &&
 		previousSnapshot !== null &&
 		typeof previousSnapshot.entries === "number" &&
 		previousSnapshot.entries > 0 &&
@@ -212,14 +308,16 @@ export async function runOccStopRound(dataRoot, sessionId, { observation, stopHo
 		state.pendingCompactionReminder = true;
 		state.pendingBoundary = false;
 	}
-	state.transcriptSnapshot = { entries: observation.entries, bytes: observation.bytes };
+	if (observation !== null) {
+		state.transcriptSnapshot = { entries: observation.entries, bytes: observation.bytes };
+	}
 
-	// Sliding-window increment over positive token growth.
-	const increment = observation.tokens - state.lastContextTokens;
+	// Sliding-window increment over positive growth of the estimated context.
+	const increment = contextTotal - state.lastContextTokens;
 	if (increment > 0) state.increments.push(increment);
 	if (state.increments.length > MAX_INCREMENT_HISTORY) state.increments.shift();
 	state.requestCount += 1;
-	state.lastContextTokens = observation.tokens;
+	state.lastContextTokens = contextTotal;
 
 	let block = null;
 	const budgetAllows =
@@ -245,10 +343,10 @@ export async function runOccStopRound(dataRoot, sessionId, { observation, stopHo
 		}
 	} else if (state.pendingBoundary && budgetAllows) {
 		const decision = decideCompaction({
-			writeTokens: observation.tokens,
-			archiveTokens: Math.max(0, observation.tokens - KEEP_RECENT_TOKENS),
+			writeTokens: contextTotal,
+			archiveTokens: Math.max(0, contextTotal - KEEP_RECENT_TOKENS),
 			memoTokens: MEMO_TOKENS,
-			contextTokens: observation.tokens,
+			contextTokens: contextTotal,
 			completedBoundaryRequestCounts:
 				state.completedBoundaryRequestCounts.length > 0 ? [...state.completedBoundaryRequestCounts] : null,
 			remainingBoundaries: state.plan.filter((step) => step.status !== "completed").length,

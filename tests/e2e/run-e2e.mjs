@@ -22,7 +22,7 @@ const DEFAULT_ORDER = [
 	"s2-reducer-adversarial",
 	"s7-failopen",
 	"s6-alloff-zero",
-	"s5-occ-stopblock", // honest negative on the economic trigger — see recorded result
+	"s5-occ-stopblock", // economic trigger verified reachable after P2.5 cumulative estimator — see recorded result
 	"s5b-stopblock-channel", // Stop decision:block channel proof (complements s5)
 ];
 

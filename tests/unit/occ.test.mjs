@@ -2,7 +2,8 @@
  * OCC adapter state machine unit tests: boundary detection from TodoWrite
  * payloads (Zcode todos carry no id), CORRECTION reset, Stop economics via a
  * fabricated transcript, compaction detection + delayed reminder, block
- * budgets.
+ * budgets, and the G21 cumulative estimator (hooks-side byte accumulation,
+ * threshold reachability under the real 1M window, honest detector downgrade).
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -11,9 +12,13 @@ import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	CHARS_PER_TOKEN,
+	SYSTEM_BASELINE_TOKENS,
+	accumulateOccUsage,
 	initialOccState,
 	loadOccState,
 	observeTranscript,
+	resolveContextWindowTokens,
 	runOccCorrection,
 	runOccStopRound,
 	runOccTodoBoundary,
@@ -163,6 +168,8 @@ test("compaction detection sets the reminder; delivered on the NEXT stop", async
 		let state = await loadOccState(root, SESSION);
 		assert.equal(state.pendingCompactionReminder, true);
 		assert.equal(state.priorCompactionCount, 1);
+		// A full-conversation transcript re-arms the detector (availability rule).
+		assert.equal(state.compactionDetection, "available");
 
 		const second = await runOccStopRound(root, SESSION, { observation: observation1, stopHookActive: false });
 		assert.notEqual(second.block, null);
@@ -244,5 +251,154 @@ test("reminder is cleared when the session block budget is permanently exhausted
 		assert.equal(second.block, null);
 		state = await loadOccState(root, SESSION);
 		assert.equal(state.pendingCompactionReminder, false, "permanent exhaustion clears the reminder");
+	});
+});
+
+// ---------------------------------------------------------------- G21 cumulative estimator
+
+/** A 30-step plan: step 1 completed, 29 pending (e2e s5 shape). */
+const PLAN_30 = Array.from({ length: 30 }, (_v, i) => ({
+	id: `t${String(i + 1).padStart(2, "0")}`,
+	goal: `Step ${String(i + 1).padStart(2, "0")}`,
+	status: i === 0 ? "completed" : "pending",
+}));
+
+test("cumulative estimator accumulates prompt/tool/assistant bytes across hook events (G21)", async () => {
+	await withRoot(async (root) => {
+		await accumulateOccUsage(root, SESSION, 700, "prompt");
+		let state = await loadOccState(root, SESSION);
+		assert.equal(state.cumulativeBytes, 700);
+		assert.equal(state.estimatedTokens, Math.ceil(700 / CHARS_PER_TOKEN));
+
+		await accumulateOccUsage(root, SESSION, 108_894, "tool:Bash");
+		await accumulateOccUsage(root, SESSION, 11, "assistant");
+		state = await loadOccState(root, SESSION);
+		assert.equal(state.cumulativeBytes, 109_605);
+		assert.equal(state.estimatedTokens, 27_402);
+
+		// Stop round with a G21-shaped transcript (single entry, ~25 tokens):
+		// the estimator still sees the conversation-scale cumulative.
+		const tiny = join(root, "tiny.jsonl");
+		await writeFile(tiny, transcript(1, 100), "utf8");
+		const observation = await observeTranscript(tiny);
+		const result = await runOccStopRound(root, SESSION, { observation, stopHookActive: false });
+		assert.equal(result.block, null);
+		state = await loadOccState(root, SESSION);
+		assert.equal(state.requestCount, 1);
+		assert.equal(state.estimatedTokens, 27_402);
+		// max(cumulative + system baseline, transcript estimate): cumulative wins.
+		assert.equal(state.lastContextTokens, 27_402 + SYSTEM_BASELINE_TOKENS);
+		assert.deepEqual(state.increments, [27_402 + SYSTEM_BASELINE_TOKENS]);
+		assert.equal(state.transcriptSnapshot.entries, 1);
+	});
+});
+
+test("threshold reachability: accumulated tool volume reaches the economic block under the REAL 1M window (G21)", async () => {
+	await withRoot(async (root) => {
+		const tiny = join(root, "tiny.jsonl");
+		await writeFile(tiny, transcript(1, 100), "utf8");
+		const observation = await observeTranscript(tiny);
+
+		await setOccStateForTests(root, SESSION, { plan: PLAN_30, pendingBoundary: true, completedBoundaryRequestCounts: [1] });
+
+		// Round A (one prompt + one ~106KB native Bash output + short reply):
+		// single-increment economics can never fire (notes.math — negative
+		// discriminant), so Stop #1 must stay silent.
+		await accumulateOccUsage(root, SESSION, 700, "prompt");
+		await accumulateOccUsage(root, SESSION, 108_894, "tool:Bash");
+		const stop1 = await runOccStopRound(root, SESSION, { observation, stopHookActive: false, assistantBytes: 11 });
+		assert.equal(stop1.block, null, "no premature block on a single increment");
+		assert.equal(stop1.decision.compact, false);
+		assert.equal(stop1.state.contextWindowTokens, 1_000_000);
+		assert.equal(stop1.state.increments.length, 1);
+
+		// Round B (second ~106KB output): two increments collapse the average,
+		// the window request bound opens, breakeven fits the horizon → compact.
+		await accumulateOccUsage(root, SESSION, 108_894 + 400, "tool:Bash");
+		const stop2 = await runOccStopRound(root, SESSION, { observation, stopHookActive: false, assistantBytes: 5 });
+		assert.notEqual(stop2.block, null);
+		assert.equal(stop2.block.kind, "economic");
+		assert.ok(stop2.block.reason.startsWith("[sol-occ]"));
+		assert.equal(stop2.decision.compact, true);
+		assert.equal(stop2.decision.reason, "economic");
+		const state = await loadOccState(root, SESSION);
+		assert.equal(state.pendingBoundary, false);
+		assert.equal(state.consecutiveBlocks, 1);
+		assert.equal(state.totalBlocks, 1);
+		assert.equal(state.increments.length, 2);
+		assert.ok(state.lastContextTokens >= 60_000, `context estimate reached conversation scale, got ${state.lastContextTokens}`);
+		assert.equal(state.contextWindowTokens, 1_000_000, "real window — no threshold lowering");
+
+		// Continuation Stop (stop_hook_active): a re-armed boundary still
+		// decides economically → second block; a third is refused by the
+		// consecutive self-limit.
+		await setOccStateForTests(root, SESSION, { pendingBoundary: true });
+		const stop3 = await runOccStopRound(root, SESSION, { observation, stopHookActive: true });
+		assert.notEqual(stop3.block, null);
+		assert.equal(stop3.block.kind, "economic");
+		await setOccStateForTests(root, SESSION, { pendingBoundary: true });
+		const stop4 = await runOccStopRound(root, SESSION, { observation, stopHookActive: true });
+		assert.equal(stop4.block, null, "consecutive budget (2) exhausted");
+
+		// Decision-path ledger evidence in the chained history.
+		const history = (await verifyChainFile(occHistoryPath(root, SESSION)), await readFileLines(root));
+		const reasons = history.map((entry) => entry.reason);
+		assert.ok(reasons.includes("stop-block-economic"));
+	});
+});
+
+async function readFileLines(root) {
+	const { readFile } = await import("node:fs/promises");
+	const raw = await readFile(occHistoryPath(root, SESSION), "utf8");
+	return raw
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => JSON.parse(line));
+}
+
+test("compaction detector is honestly recorded as unavailable under a last-message-only transcript (G21)", async () => {
+	await withRoot(async (root) => {
+		const tiny = join(root, "tiny.jsonl");
+		await writeFile(tiny, transcript(1, 100), "utf8");
+		const observation = await observeTranscript(tiny);
+		// Large accumulated conversation + pinned-at-1 entries → detector
+		// structurally blind; it must be recorded as such, never fake a drop.
+		await accumulateOccUsage(root, SESSION, 200_000, "tool:Bash");
+		await setOccStateForTests(root, SESSION, { transcriptSnapshot: { entries: 1, bytes: 110 } });
+		const result = await runOccStopRound(root, SESSION, { observation, stopHookActive: false, assistantBytes: 11 });
+		assert.equal(result.block, null);
+		const state = await loadOccState(root, SESSION);
+		assert.equal(state.compactionDetection, "unavailable");
+		assert.equal(state.priorCompactionCount, 0);
+		assert.equal(state.pendingCompactionReminder, false);
+	});
+});
+
+test("resolveContextWindowTokens: payload field wins, env knob overrides the default (reduced-window simulation)", async () => {
+	assert.equal(resolveContextWindowTokens({ payloadWindow: 200_000, env: { SOL_ZCODE_OCC_WINDOW_TOKENS: "50000" } }), 200_000);
+	assert.equal(resolveContextWindowTokens({ payloadWindow: undefined, env: { SOL_ZCODE_OCC_WINDOW_TOKENS: "50000" } }), 50_000);
+	assert.equal(resolveContextWindowTokens({ payloadWindow: undefined, env: {} }), undefined);
+	assert.equal(resolveContextWindowTokens({ payloadWindow: -5, env: { SOL_ZCODE_OCC_WINDOW_TOKENS: "junk" } }), undefined);
+
+	// The injected reduced window makes a modest accumulated context trigger
+	// via window_protection (the sanctioned simulation path — constants stay
+	// untouched in production).
+	await withRoot(async (root) => {
+		const tiny = join(root, "tiny.jsonl");
+		await writeFile(tiny, transcript(1, 100), "utf8");
+		const observation = await observeTranscript(tiny);
+		await setOccStateForTests(root, SESSION, { plan: PLAN_30, pendingBoundary: true });
+		await accumulateOccUsage(root, SESSION, 88_000, "tool:Bash");
+		const result = await runOccStopRound(root, SESSION, {
+			observation,
+			stopHookActive: false,
+			assistantBytes: 11,
+			contextWindowTokens: resolveContextWindowTokens({ env: { SOL_ZCODE_OCC_WINDOW_TOKENS: "50000" } }),
+		});
+		assert.notEqual(result.block, null);
+		assert.equal(result.block.kind, "economic");
+		assert.equal(result.decision.reason, "window_protection");
+		const state = await loadOccState(root, SESSION);
+		assert.equal(state.contextWindowTokens, 50_000);
 	});
 });

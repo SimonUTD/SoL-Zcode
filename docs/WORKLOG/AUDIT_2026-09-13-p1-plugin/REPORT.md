@@ -146,3 +146,57 @@
 - 防护与证据链不是纸面设计：V5/V6 两项黑盒实测（篡改可抓、真机回执可过 validateReceipt）证明了 C3/C4 的实际效力，这在纯静态审核里是拿不到的置信度。
 - 测试工程化程度高：fake-zcode 二进制同时充当协议探针（记录 argv/env/attach 字节数供防御断言）、3 进程并发链测试、逐字节 recall 还原断言——"协议级无模型测试"的方法论执行到位。
 - 本审核新增的 V6（reducer 真机端到端）证明 ps 嗅探解析宿主二进制、--attach 传输、隔离 HOME、90s 超时、LRU、逐字核验在真实环境全部成立，为 P2/P3 扫清了最大的未知数。
+
+---
+
+# 复审（2026-09-13，整改核验）
+
+- 对象：`e01ec42` "fix(P1): address audit findings (2 MAJOR + 11/14 MINOR)" + `cc443e0` "docs: fold audit m10 exception into DESIGN §3; add GOTCHAS G20"（工作树 clean；本报告 v1 文本经 diff 核对被原样提交，未被改动）。
+- 方法：两 commit 全量 diff 逐行复核 → M1 名单对 zcode.cjs 运行时注册表独立重提取比对 → 复跑 `node scripts/run-tests.mjs`（124/124 全绿，61s）→ 复跑开发方复现脚本 `/tmp/m1-repro/check.mjs`、`/tmp/m2-repro/check.mjs` → **真机回归冒烟 1 次**（隔离 HOME + 真实模型走整改后的 reducer 全链路）。
+
+## R1. 总体结论
+
+**终评分：9.5 / 10 —— 通过 P1 验收门（≥9.5）。**
+
+两个 MAJOR 均已正确修复且经独立双证（本审核复现 + 开发方可复跑脚本）；14 条 MINOR：10 条代码修复、2 条文档/裁决留置（m10 由文档 owner 补录 DESIGN §3 例外条款 + 代码内裁决说明）、1 条按审核建议点名 P2（m9）、1 条无害留置（m13）——处置全部与回执申报一致。未发现整改引入的新缺陷；vendor core 零改动（修复全部落在适配层）。
+
+## R2. 逐条判定
+
+| 项 | 判定 | 复核证据 |
+|---|---|---|
+| M1 denylist 漏 Cron×4/Task 族 | **已修复（双证）** | ① 本审核独立重提取 zcode.cjs 注册表数组 `["Agent",…,"Write"]` 共 31 名，与代码 "registered" 段**逐一相符**；② `/tmp/m1-repro/check.mjs` 实跑：registry 31 名 MISSING=(none)，真实子进程 argv 与 BUILTIN_TOOL_NAMES 逐字节一致，Cron×4 在 argv 中；③ 18 个曾缺失名族的逐名回归断言（reducer-pipeline.test.mjs）；④ GOTCHAS G20 回写注册表清单+版本升级复核指引（符合 PLAN"回写结论"要求） |
+| M2 >64KiB 行断链 | **已修复（双证）** | readLastLine 自适应读窗（段起点 >0 ⟺ 行首在窗内，否则 4× 增长直至覆盖行首或全文件；逻辑复核无误，空文件/边界正确）；3 条回归复刻审核复现形状（73953B/82401B 行）；`/tmp/m2-repro/check.mjs` 实跑：旧算法取到碎片、新算法返回完整行，第二行 prevHash===第一行 hash、≠创世，verify ok |
+| m1 粘 mcp-direct | 已修复 | `refreshToolContextSession` 每次 tools/call 重解析指针 + "指针晚于 server 启动"测试；注：指针出现前的写入仍落 mcp-direct（分裂归属），严格优于原粘滞行为 |
+| m2 缓存 key 占位模型 | 已修复（测试典范） | `resolveHostModel` 实读宿主 config；3 连调用测试断言 cacheHit=false→true→（宿主换模型）→false |
+| m3 全工具串行化 | 留置有据 | 代码内权衡说明（串行换链序确定性；跨进程本就有 O_EXCL 锁）——符合审核"宜记录"建议 |
+| m4 跨进程 reducer-home rm 竞态 | 已修复 | per-runId 目录（`reducer-home-<uuid8>`）+ 1h 陈货清扫 + 并发双调用测试（both ok、零残留）；真机复跑 run/ 无残留 |
+| m5 同内容 todo 撞 id | 已修复 | 出现序后缀 -2/-3 保持唯一、首例保持裸哈希 id；测试断言 id 序列。残留 nano 纹：同内容中 cancelled 项被移除后幸存者后缀会移位（按 payload 确定性，可接受） |
+| m6 gate 漏 MultiEdit 等 | 已修复 | GATE_MUTATION_TOOLS={Write,Edit,MultiEdit,NotebookEdit,ApplyPatch} + 5 拦/5 放矩阵测试；Bash 不拦的裁量有注记（合理） |
+| m7 截断冒充全文 | 已修复 | ledger 增 `source:"stdout"`/`possiblyTruncated:true` 溯源标记，双路径测试 |
+| m8 缺省根不一致 | 已修复 | verify-evidence 改用 store.mjs `dataRoot` + 缺省根布局测试 |
+| m9 "写前读"缺口 | 留置有据（按建议） | 测试改名 + 显式 gap-marker 断言（P1 契约=存在+精确匹配），点名 P2 |
+| m10 config_rejected 例外 | **双重解决** | 代码内裁决说明 + DESIGN §3 补录例外条款（cc443e0，措辞与审核建议一致） |
+| m11 Note 被回执吞 | 已修复 | Note 移至标记前（保留前缀），"约简后 Note 存活"测试 |
+| m12 server 不记 config_rejected | 已修复 | server 启动记 `config_rejected`（source=mcp），与 hook 侧对齐 |
+| m13 matcher 含 compact | 留置有据 | 与官方 example 同款、0.16.5 不触发，无害 |
+| m14 提醒滞留 | 已修复 | 会话总预算耗尽→清账（连续预算暂时耗尽仍保留）+ 测试 |
+
+## R3. 整改质量核验（新问题扫描）
+
+- **测试**：114→124，新增 10 条全部瞄准审核项、无旧断言弱化（m9 改名是把误导性标题改诚实）；m2 缓存三段式与 m1 晚指针两条属高质量回归。复跑全绿。
+- **vendor 完整性**：修复零触及 plugin/core/**（chain/occ/store 均为适配层），C1 零依赖不变（verify-evidence 新 import 为内部相对路径）。
+- **真机回归**（V8）：隔离 HOME + GLM 真模型，整改后 reducer 全链路（44 名 denylist argv、per-run home、缓存 key 实模型化）candidate→applied 正常、run/ 零残留、verify 全绿——修复未破坏真实路径。
+- **新引入问题**：未发现。两条记录在案的 nano 纹（m5 后缀移位、m1 分裂归属）均为确定性/方向安全，不构成缺陷。
+
+## R4. 评分
+
+| 维度 | 权重 | 得分 | 依据 |
+|---|---|---|---|
+| 机制保真 | 30% | 9.5 | vendor 零改动；修复均落在适配层且与上游不变式对齐（缓存 key 全要素恢复） |
+| 硬约束 C1–C4 | 30% | 9.5 | M1/M2 关闭且双证；C2 例外条款已入 DESIGN；残余项均为设计已声明或留置有据 |
+| 测试真实性与覆盖 | 25% | 9.5 | +10 条针对性回归、无弱化、复现脚本可复跑 |
+| 工程质量 | 15% | 9.5 | 竞态关闭、归属健壮、陈货清扫、权衡留痕 |
+
+**加权 9.5 → 终评分 9.5 / 10。P1 验收门通过，批准进入 P2。**
+
+留给 P2 的在案事项（不扣门）：m9 真模型等价（含 Read-before-Edit 会话语义）；reducer 对抗性 e2e（建议加 Cron 注入向量，检验 denylist 实效）；UserPromptSubmit additionalContext 复检（G9 未决项）。

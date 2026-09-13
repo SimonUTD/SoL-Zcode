@@ -8,9 +8,10 @@ Design (docs/DESIGN.md §7, docs/RESEARCH/terminal-bench-4.md §4):
   install()  node >=22 (bundled pinned tarball, else nvm) -> upload bundle
              (zcode.cjs + plugin tree + install-plugin.mjs + assets) ->
              install-plugin.mjs with the arm's plugins.options (REPLACE
-             semantics, G19) -> write G2 three-part cli config with the apiKey
-             injected from the ZCODE_BIGMODEL_KEY env (--ae; never argv,
-             never logs).
+             semantics, G19) -> write G2 three-part cli config; the apiKey
+             comes from --ae ZCODE_BIGMODEL_KEY or the host's
+             ~/.zcode/v2/config.json (read-only) and reaches the container
+             only via exec env — never argv, never logs, never the image.
   run()      node zcode.cjs --prompt <instruction> --mode yolo --json
              (G3/G18: --max-turns/--allowed-tools are broken; timeout is the
              trial-level agent timeout plus an in-band `timeout` cap), with
@@ -51,53 +52,39 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 BENCH_ROOT = Path(__file__).resolve().parent.parent
-# Make `pricing` importable however this module is loaded (as
-# `agent.zcode_agent` with benchmark/ on PYTHONPATH, or directly).
+# Make sibling modules importable however this module is loaded.
 if str(BENCH_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCH_ROOT))
+from bench_config import (  # noqa: E402
+    ARM_OPTIONS,
+    CONTAINER_ROOT,
+    DEFAULT_MODEL,
+    DEFAULT_ZCODE_CJS,
+    MARKETPLACE,
+    PLUGIN_ID,
+    SELF_CAP_SEC,
+)
 from pricing import cost_usd  # noqa: E402
 
 REPO_ROOT = BENCH_ROOT.parent
 
-DEFAULT_ZCODE_CJS = Path(
-    os.environ.get(
-        "SOL_BENCH_ZCODE_CJS",
-        "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
-    )
-)
-CONTAINER_ROOT = "/opt/sol-bench"
-MARKETPLACE = "sol-zcode-bench"
-PLUGIN_ID = f"sol-zcode@{MARKETPLACE}"
-DEFAULT_MODEL = "builtin:bigmodel-coding-plan/GLM-5.3-Flash"
-
-# Self-managed cap on top of Harbor's trial-level agent timeout (task.toml
-# [agent] timeout_sec = 28800 for every TB 4.0 task). Keeping them equal means
-# the in-band `timeout` fires first and the failure lands in OUR stderr with a
-# clear exit 124 instead of a container-level kill.
-SELF_CAP_SEC = int(os.environ.get("SOL_BENCH_AGENT_CAP_SEC", "28800"))
-
-ARM_OPTIONS: dict[str, dict[str, Any]] = {
-    "control": {
-        "actionFusion": False,
-        "observationPack": False,
-        "evidenceReducer": False,
-        "onlineCompact": False,
-        "trajectory": False,
-        "actionFusionGate": False,
-        "reducerModel": "",
-    },
-    "treatment": {
-        "actionFusion": True,
-        "observationPack": True,
-        "evidenceReducer": True,
-        "onlineCompact": True,
-        "trajectory": True,
-        "actionFusionGate": False,
-        "reducerModel": "",
-    },
-}
-
 _bundle_path: str | None = None
+
+
+def _host_api_key() -> str | None:
+    """Read the provider apiKey from the host's app config (read-only).
+
+    Precedence: explicit ZCODE_BIGMODEL_KEY (--ae) beats the host v2 config.
+    The host file is the app's own logged-in credential — the benchmark never
+    stores it anywhere; it is injected into the container exec env only.
+    """
+    path = Path.home() / ".zcode" / "v2" / "config.json"
+    try:
+        cfg = json.loads(path.read_text())
+        entry = cfg.get("provider", {}).get("builtin:bigmodel-coding-plan", {})
+        return entry.get("options", {}).get("apiKey") or None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def build_bundle() -> str:
@@ -271,11 +258,11 @@ node --version
         )
 
     async def _write_cli_config(self, environment: BaseEnvironment) -> None:
-        key = self._get_env("ZCODE_BIGMODEL_KEY")
+        key = self._get_env("ZCODE_BIGMODEL_KEY") or _host_api_key()
         if not key:
             raise RuntimeError(
-                "ZCODE_BIGMODEL_KEY is not set — pass it with "
-                "`harbor run --ae ZCODE_BIGMODEL_KEY=...`"
+                "no API key: set ZCODE_BIGMODEL_KEY via `harbor run --ae` or "
+                "have ~/.zcode/v2/config.json on the host (read-only source)"
             )
         await self.exec_as_agent(
             environment,
@@ -284,8 +271,8 @@ node --version
                 f"{CONTAINER_ROOT}/provider-template.json "
                 f"--home \"$HOME/.zcode\" --model {shlex.quote(self._model())}"
             ),
-            # Key flows via exec env (scoped by Harbor, redacted in logs);
-            # never via argv, never into the bundle image.
+            # Key flows via exec env (redacted in harbor logs); never via
+            # argv, never into the bundle, never into the image.
             env={"ZCODE_BIGMODEL_KEY": key},
         )
 
@@ -396,7 +383,7 @@ node --version
         }
         if self._run_started is not None:
             meta["agentWallMs"] = int(
-                (self._run_finished or time.monotonic()) - self._run_started
+                ((self._run_finished or time.monotonic()) - self._run_started) * 1000
             )
 
         if payload is None:

@@ -10,8 +10,9 @@
 - `--disallowed-tools "Bash"`：**有效**——模型尝试 echo 被拒，复述"Bash 不可用"。
 - 结论：reducer 子进程封工具面改用 `--disallowed-tools` 枚举内置工具名（+隔离 home 使 MCP/插件工具根本不加载）。
 
-## 3. reducer 子进程最终三层防护（升级 DESIGN §2.3）
-1. **隔离 ZCODE_HOME**：子进程 env `ZCODE_HOME=$ZCODE_PLUGIN_DATA/run/reducer-home/`，内放仅含 `{provider:<宿主同款>, model:<reducerModel||宿主 model>}` 的 cli config.json（spawn 时从宿主 cli config 程序化拷贝 provider 段——凭据来源仍是 Zcode 自身配置，C4 成立）→ 插件/用户 MCP 完全不加载（也根除重入，aux 标记降级为双保险）。
+## 3. reducer 子进程最终三层防护（升级 DESIGN §2.3；已合入 DESIGN）
+1. **隔离 HOME（主路径）**：子进程 env `HOME=$ZCODE_PLUGIN_DATA/run/reducer-home/`，内放仅含 `{provider:<宿主同款>, model:<reducerModel||宿主 model>}` 的 cli config.json（spawn 时从宿主 cli config 程序化拷贝 provider 段——凭据来源仍是 Zcode 自身配置，C4 成立）→ 插件/用户 MCP 完全不加载（也根除重入，aux 标记降级为双保险）。
+   注意：无 ZCODE_HOME 变量（终审 n2）；home 经 os.homedir()（unix=HOME env）解析。
 2. `--disallowed-tools` 内置工具清单（Bash Read Write Edit Glob Grep Agent Task TodoWrite WebFetch WebSearch ... P1 定稿）。
 3. `SOL_ZCODE_AUX=1`（hooks/MCP 见之零行为，防宿主行为变化）。
 

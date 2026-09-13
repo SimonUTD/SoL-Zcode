@@ -25,6 +25,7 @@
   5. sol_write/sol_edit 变异语义等价测试组（vs 内置 Write/Edit：唯一匹配/replace_all/写前读/不存在路径等用例）。
   6. 证据存储 + hash 链账本（含 session-summary.json 终态锚点）+ `scripts/verify-evidence.mjs`。
   7. `tests/unit/`（core 断言等价移植）+ `tests/integration/`（MCP 握手/hook fixture/verify 篡改检测/全关零行为/aux 零行为）。
+  8. 终审提示两条（来自 AUDIT 终审）：① reducerModel 覆盖时须断言目标 model 存在于拷贝的 provider registry 内（否则触发 G2 "Model config missing"）；② reducer-home 目录按调用重建/清理（防子会话文件累积）。
 - **禁止事项**：npm 运行时依赖（零依赖 node:*）；密钥/绝对家目录写死；占位符/TODO 交差。
 - **期望输出**：证据化摘要（文件清单+测试命令+结果计数+关键行号+两个开工实证的结论）。
 - **验收门**：`node --test tests/unit tests/integration` 全绿；审核 subagent ≥9.5。

@@ -271,3 +271,27 @@ treatment 不含 gate（§7↔P3↔风险表）、freeze 路径（benchmark/free
 
 **结论**：n1、n2 为开工前必改（预计 10 分钟编辑量：§2.3/§3/§6.3/G18 四处）；n3 列入 P1 首任务验证清单；n4/n5 顺手修。**修完即可进入 P1，无需第三轮全审**（如需形式过门，可只对上述四处做快速 diff 复核）。
 
+### 终审（2026-09-13，commit `d13f81c`，快速 diff 复核）
+
+**评分：9.5 / 10 —— 通过 P0 验收门（≥9.5）。**
+
+**n1–n5 复核判定**（git diff HEAD~1，范围与申报一致：DESIGN §2.3/§3/§6.3、GOTCHAS 重排+G18/G19、PLAN 标题与首任务）：
+
+| 项 | 判定 | 复核证据 |
+|---|---|---|
+| n1 幻影旗标/工具面 | **已落实（优于要求）** | DESIGN §2.3:76-81 三层防护按效力排序：①隔离 HOME（`HOME=$ZCODE_PLUGIN_DATA/run/reducer-home/` + 仅 `{provider,model}` 的 cli config，provider 段从宿主 config 程序化拷贝）→ 插件与用户 MCP **根本不加载**，重入连根拔除（比我建议的"枚举封禁"更强，也顺带消除了"其他用户 MCP server"边缘面）；②`--disallowed-tools` 枚举内置（实测有效）；③SOL_ZCODE_AUX 第三保险。`--allowed-tools` 明确标注幻影不可用；提示词防线降格为"不作为防线"；P2 对抗性 e2e 保留；PLAN P1 首任务②改为验证 `--disallowed-tools` 覆盖面 |
+| n2 ZCODE_HOME | **已落实** | DESIGN §3:104 "home=进程 HOME→os.homedir()，路径 `<home>/.zcode/cli/config.json`"；§6.3:134 改"隔离 HOME 副本（env HOME 指向临时目录）"，与 PLAN P2 一致；G18 记"无 ZCODE_HOME 变量"。全文档 grep 无残留误用（仅 spike/PENDING-MERGES.md 草稿里一处旧标签，见下） |
+| n3 超时安全阀 | **已落实（延后实证合规）** | DESIGN §3:111 "deadline 语义 P1 实证，若无界则 600s 进程级安全阀并记 §8"；PLAN P1 首任务③ 对应。预先承诺 fallback，符合延后实证三条件 |
+| n4 编号乱序 | **已落实** | G16–G19 移至 G15 之后顺序排列，G16 交叉引用改指 G19 |
+| n5 PLAN 版本号 | **已落实** | 标题改"v2，按 AUDIT_2026-09-13-design 修订" |
+
+**新增证据交叉核实**（主控补充实测 vs 本审核独立证据，全部吻合）：
+- G19 `plugins.options` 形状 `record(string, record(string, string|number|boolean))`——本轮反编译复核运行时 schema 命中 `options:g.record(g.string(),g.record(g.string(),NAo)).optional()`（plugins 配置对象内），与 G19/DESIGN §3 一致；`ZCODE_PLUGIN_ID` 作键的说法与我 R2 备注一致。
+- G18 `--disallowed-tools` 有效 / `--allowed-tools` 幻影 / `--attach` 可达模型——与 R3-1/2/3 实测一致；DESIGN §2.3 已标"实测"。
+
+**剩余瑕疵（不扣门，记录在案）**：
+1. `spike/PENDING-MERGES.md` §3 仍写"隔离 ZCODE_HOME"（草稿文件未随合并清理/改词）——建议删除该文件或改为"隔离 HOME"，避免后续读者混淆。
+2. P1 测试提示两条（非方案缺陷）：a) reducerModel 覆盖时需断言该 model 字符串存在于拷贝的 provider registry（G2：不在 registry 会报 Model config is missing）；b) reducer-home 会累积子会话 rollout/exec 文件，建议每次调用用后清理或按调用重建目录。
+
+**终审结论**：v1→v2→v2.1 三轮修订后，方案的全部关键通道假设（配置闭环、两条提醒通道、附件传输、工具面封死、防重入、防篡改措辞、双臂口径）均已实证或反编译佐证；剩余未知项（deadline 语义、mcp__ 覆盖、UI 样本复核、UserPromptSubmit 复检）全部置于 P1/P2 首任务且有 fail-safe 回退——这正是"方案层承诺+开发层实证"的正确分界。**9.5 / 10，P0 通过，批准进入 P1。**
+

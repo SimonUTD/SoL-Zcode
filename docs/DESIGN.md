@@ -108,6 +108,7 @@ $ZCODE_PLUGIN_DATA/
   - `actionFusionGate`（Write/Edit exit-2 硬引导；不进基准 treatment）
   - `reducerModel`（string，"" = 继承主模型）
 - **解析规则**：键缺失=false；类型不符=false + trajectory 记 `config_rejected`（fail-safe 而非 fail-crash，理由 §1）；文件缺失/JSON 损坏=全关（C2 安全侧）。
+  - 例外说明（AUDIT_2026-09-13-p1-plugin m10 裁决）：`config_rejected` 是"全关+类型错键"状态下唯一的特许写入——理由：打错的 opt-in 与真正禁用若不可区分，会污染 A/B 双臂（control 臂可能悄悄少机制）；可诊断性优先。严格"未配置=零文件"语义仅适用于"键不存在或值为合法 false"的情形。
 - **aux 防重入（M5）**：环境 `SOL_ZCODE_AUX=1` 存在时，hooks 与 MCP server 一律零行为（reducer 子进程标记；与隔离 HOME 双保险）。
 - **超时安全阀（n3）**：then_run 不设默认超时（对齐上游）；sol_* MCP 工具对宿主侧调用 deadline 语义 P1 实证，若无界则实现 600s 进程级安全阀并记入 §8。
 - **禁用=零行为**：全关时 hooks 立即 stdout 空、exit 0（无任何副作用文件）；MCP server 仍随宿主拉起但 tools/list 返回空列表 + stderr 一行日志。测试钉死。

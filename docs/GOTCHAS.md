@@ -90,3 +90,9 @@
 - `plugins.options = { "<plugin-id>": { "<userConfigKey>": string|number|boolean } }`（`g.record(g.string(), g.record(g.string(), union(string|number|boolean)))`）。
 - plugin-id 与 enabledPlugins 同键域（`<name>@<marketplace>`）；hook 子进程 env 实含 `ZCODE_PLUGIN_ID` 可直接作键。
 - UI 保存插件 userConfig 即写此处；脚本可程序化写入（安装与基准双臂配置同一通道）。
+
+## G20. 内置工具注册表实名清单（0.16.5，P1 整改 M1 反编译结论）
+- 运行时注册表 `new Set([...])` 共 **31 个内置工具名**：Agent, AskUserQuestion, Bash, CronCreate, CronDelete, CronList, CronUpdate, Edit, EnterPlanMode, EnterWorktree, ExitPlanMode, ExitWorktree, Glob, Grep, ListMcpResources, LSP, Memory, NotebookEdit, Read, ScheduleWakeup, Skill, TaskOutput, TaskStop, TodoRead, TodoWrite, WebFetch, WebSearch, Workflow, Write, 及 Task 别名族。
+- tool-rule 解析器另有别名规范化表（ApplyPatch→Write/Edit、SendMessage、ReadSessionContext、RespondToCoordinator、GoalRead、web_search、js 等）。
+- `--disallowed-tools` 匹配是纯名字集合成员测试，未知名 inert 不报错——枚举宁多勿漏（实现见 plugin/hooks/lib/reducer-subprocess.mjs BUILTIN_TOOL_NAMES，44 项=31 实名+10 别名+3 跨版本兼容，回归测试逐名钉死）。
+- 升级 zcode 版本时须重新反编译核对该清单（实现处已留复核指引）。

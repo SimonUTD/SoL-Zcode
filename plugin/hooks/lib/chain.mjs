@@ -76,24 +76,56 @@ async function releaseLock(path) {
 	await rm(path, { force: true });
 }
 
-/** Read the last complete JSONL line of a file (tail-bounded). */
+/**
+ * Read the last complete JSONL line of a file.
+ *
+ * The initial read window is maxBytes from EOF. When that window does not
+ * contain the start of the last non-empty line — e.g. a single ledger line
+ * larger than the window; occ-history embeds the full OCC state including the
+ * plan, and parsePlanSteps allows 128 steps × 16 KiB goals, so real lines can
+ * exceed 64 KiB (audit M2) — the window grows 4× until it covers the line
+ * start or the whole file. The returned line is therefore always the complete
+ * last line, never a mid-line fragment (a fragment would fail JSON.parse in
+ * readChainHead and silently restart the chain from GENESIS).
+ */
 export async function readLastLine(path, maxBytes = 64 * 1024) {
 	let handle;
 	try {
 		handle = await open(path, constants.O_RDONLY);
 		const stats = await handle.stat();
-		const length = Math.min(stats.size, maxBytes);
-		const buffer = Buffer.alloc(length);
-		await handle.read(buffer, 0, length, stats.size - length);
-		const text = buffer.toString("utf8");
-		const lines = text.split("\n").filter((line) => line.trim().length > 0);
-		return lines.length > 0 ? lines[lines.length - 1] : null;
+		let length = Math.min(stats.size, maxBytes);
+		for (;;) {
+			const buffer = Buffer.alloc(length);
+			await handle.read(buffer, 0, length, stats.size - length);
+			const text = buffer.toString("utf8");
+			const candidate = lastNonEmptySegment(text);
+			if (candidate === null) {
+				if (length >= stats.size) return null;
+				length = Math.min(stats.size, length * 4);
+				continue;
+			}
+			// The candidate is complete when its line start lies inside the
+			// window (a newline precedes it here) or the window covers the file.
+			if (candidate.startIndex > 0 || length >= stats.size) return candidate.value;
+			length = Math.min(stats.size, length * 4);
+		}
 	} catch (error) {
 		if (typeof error === "object" && error !== null && error.code === "ENOENT") return null;
 		throw error;
 	} finally {
 		await handle?.close();
 	}
+}
+
+/** Last non-empty "\n"-separated segment of text, with its start offset; null when none. */
+function lastNonEmptySegment(text) {
+	let start = 0;
+	let best = null;
+	for (const segment of text.split("\n")) {
+		if (segment.trim().length > 0) best = { value: segment, startIndex: start };
+		start += segment.length + 1;
+	}
+	return best;
 }
 
 /** Parse the tail of a chained ledger; returns {hash, obj} of the last line or null. */

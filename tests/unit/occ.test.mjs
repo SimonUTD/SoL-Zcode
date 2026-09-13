@@ -62,6 +62,24 @@ test("todosToPlan synthesizes content-hash ids for Zcode TodoWrite payloads", ()
 	assert.equal(todosToPlan([{ status: "pending" }]), undefined);
 });
 
+test("duplicate-content todos get unique synthesized ids instead of dropping the plan (m5)", () => {
+	// Same-content todos used to collide on the content-hash id →
+	// parsePlanSteps rejected the whole array → the plan update was silently
+	// discarded. Occurrence suffixes keep ids unique; the first occurrence
+	// keeps the bare hash id.
+	const plan = todosToPlan([
+		{ content: "fix the bug", status: "in_progress" },
+		{ content: "fix the bug", status: "pending" },
+		{ content: "fix the bug", status: "pending" },
+		{ content: "ship it", status: "pending" },
+	]);
+	assert.notEqual(plan, undefined, "plan must not be dropped for duplicate content");
+	assert.deepEqual(
+		plan.map((step) => step.id),
+		[todoId("fix the bug"), `${todoId("fix the bug")}-2`, `${todoId("fix the bug")}-3`, todoId("ship it")],
+	);
+});
+
 test("todo boundary sets pendingBoundary and records request counts", async () => {
 	await withRoot(async (root) => {
 		await setOccStateForTests(root, SESSION, { requestCount: 5 });
@@ -198,4 +216,33 @@ test("initialOccState defaults match DESIGN constants", () => {
 	assert.equal(state.consecutiveBlocks, 0);
 	assert.equal(state.totalBlocks, 0);
 	assert.equal(state.increments.length, 0);
+});
+
+test("reminder is cleared when the session block budget is permanently exhausted (m14)", async () => {
+	await withRoot(async (root) => {
+		const transcriptPath = join(root, "transcript.jsonl");
+		await writeFile(transcriptPath, transcript(200, 1000), "utf8");
+		const observation = await observeTranscript(transcriptPath);
+		// Reminder pending + consecutive budget exhausted (2) but session
+		// budget not yet exhausted (2 < 3): delivery can still happen after a
+		// natural Stop resets the consecutive counter → stays pending.
+		await setOccStateForTests(root, SESSION, {
+			pendingCompactionReminder: true,
+			consecutiveBlocks: 2,
+			totalBlocks: 2,
+			transcriptSnapshot: { entries: 400, bytes: 999999 },
+		});
+		const first = await runOccStopRound(root, SESSION, { observation, stopHookActive: true });
+		assert.equal(first.block, null);
+		let state = await loadOccState(root, SESSION);
+		assert.equal(state.pendingCompactionReminder, true, "not permanently exhausted → stays pending");
+
+		// Session budget exhausted (3/3): the reminder can never be delivered
+		// again → cleared instead of lingering forever.
+		await setOccStateForTests(root, SESSION, { totalBlocks: 3 });
+		const second = await runOccStopRound(root, SESSION, { observation, stopHookActive: false });
+		assert.equal(second.block, null);
+		state = await loadOccState(root, SESSION);
+		assert.equal(state.pendingCompactionReminder, false, "permanent exhaustion clears the reminder");
+	});
 });

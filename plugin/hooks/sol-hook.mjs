@@ -37,6 +37,15 @@ import { createObservation, ensureStored, placeholderFor } from "../core/index.m
 const GATE_REASON =
 	"SoL action fusion: use sol_write / sol_edit (they accept then_run) instead of Write/Edit.";
 
+// DESIGN §2.1 names the hard gate for Write|Edit (the documented built-in
+// mutators). Extended to every file-mutating built-in observed in the runtime
+// registry / tool-rule alias list so the gate cannot be sidestepped via
+// NotebookEdit (registered in 0.16.5) or the MultiEdit/ApplyPatch names other
+// host versions expose (audit m6). Bash is deliberately NOT gated: sol_bash
+// guidance is soft (SessionStart), and blocking Bash would break every
+// non-mutating command.
+const GATE_MUTATION_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"]);
+
 async function readStdin() {
 	const chunks = [];
 	for await (const chunk of process.stdin) chunks.push(chunk);
@@ -83,14 +92,14 @@ function buildGuidance(cfg) {
 
 async function nativeToolText(toolResponse) {
 	if (toolResponse === undefined || toolResponse === null) return undefined;
-	if (typeof toolResponse === "string") return toolResponse;
+	if (typeof toolResponse === "string") return { text: toolResponse, persisted: false, truncated: false };
 	if (typeof toolResponse !== "object" || Array.isArray(toolResponse)) return undefined;
 	// Prefer the persisted full output (G6): stdout in the payload is truncated
 	// to 30000 chars for large results.
 	const persisted = str(toolResponse.persistedOutputPath);
 	if (persisted !== undefined) {
 		try {
-			return await readFile(persisted, "utf8");
+			return { text: await readFile(persisted, "utf8"), persisted: true, truncated: false };
 		} catch {
 			// fall through to stdout
 		}
@@ -98,10 +107,15 @@ async function nativeToolText(toolResponse) {
 	const stdout = str(toolResponse.stdout);
 	const stderr = str(toolResponse.stderr);
 	if (stdout !== undefined || stderr !== undefined) {
-		return [stdout ?? "", stderr ?? ""].filter((part) => part.length > 0).join("\n");
+		const text = [stdout ?? "", stderr ?? ""].filter((part) => part.length > 0).join("\n");
+		// Without the persisted file we cannot distinguish a full stdout from a
+		// 30000-char truncated one; flag the at-threshold case so the ledger
+		// never silently records a truncated tail as the full text (audit m7).
+		const truncated = toolResponse.stdoutTruncated === true || (stdout !== undefined && stdout.length >= 30_000);
+		return { text, persisted: false, truncated };
 	}
 	try {
-		return JSON.stringify(toolResponse);
+		return { text: JSON.stringify(toolResponse), persisted: false, truncated: false };
 	} catch {
 		return undefined;
 	}
@@ -112,11 +126,11 @@ async function nativeToolText(toolResponse) {
 // from the research doc does not occur. Both are matched defensively.
 const OWN_MCP_TOOL_PATTERN = /^mcp__(plugin_)?sol(-zcode)?_sol(_sol)?__/;
 
-async function archiveNativeObservation(root, sessionId, toolName, text, cfg) {
+async function archiveNativeObservation(root, sessionId, toolName, extracted, cfg) {
 	if (!cfg.observationPack) return;
 	if (typeof toolName === "string" && OWN_MCP_TOOL_PATTERN.test(toolName)) return;
 	const observation = createObservation(
-		{ toolName: toolName ?? "native", toolCallId: "", text },
+		{ toolName: toolName ?? "native", toolCallId: "", text: extracted.text },
 		observationRuntimeRoot(root),
 	);
 	if (observation === undefined) return;
@@ -131,6 +145,10 @@ async function archiveNativeObservation(root, sessionId, toolName, text, cfg) {
 			bytes: observation.bytes,
 			tokens: observation.tokens,
 			placeholderBytes: Buffer.byteLength(placeholderFor(observation), "utf8"),
+			// Provenance telemetry (audit m7): whether the archived text came
+			// from the persisted full output or a possibly-truncated stdout.
+			...(extracted.persisted ? {} : { source: "stdout" }),
+			...(extracted.truncated ? { possiblyTruncated: true } : {}),
 		});
 	} catch (error) {
 		// fail-open: native archiving is best-effort telemetry (C3 archive, no rewrite).
@@ -244,7 +262,7 @@ async function handleEvent(payload, cfg) {
 			return null;
 		}
 		case "PreToolUse": {
-			if (cfg.actionFusionGate && (toolName === "Write" || toolName === "Edit")) {
+			if (cfg.actionFusionGate && typeof toolName === "string" && GATE_MUTATION_TOOLS.has(toolName)) {
 				// exit-2 + stderr reason (G8): the only reliable hard block, and
 				// the stderr text reaches the model as the block reason.
 				process.stderr.write(GATE_REASON);
@@ -255,9 +273,9 @@ async function handleEvent(payload, cfg) {
 		}
 		case "PostToolUse": {
 			const toolResponse = pick(payload, "tool_response", "toolResponse");
-			const text = await nativeToolText(toolResponse);
-			if (text !== undefined) {
-				await archiveNativeObservation(root, sessionId, toolName, text, cfg);
+			const extracted = await nativeToolText(toolResponse);
+			if (extracted !== undefined) {
+				await archiveNativeObservation(root, sessionId, toolName, extracted, cfg);
 			}
 			if (cfg.onlineCompact && toolName === "TodoWrite") {
 				const todos = toolInput && typeof toolInput === "object" ? toolInput.todos : undefined;
@@ -326,6 +344,14 @@ async function main() {
 		// Fail-safe diagnostics: a mistyped key is an attempted opt-in that
 		// fell back to false (DESIGN §3) — journal it even if the net state
 		// ends up all-off.
+		//
+		// Deliberate exception to "all-off = zero side-effect files" (kept as
+		// designed after AUDIT_2026-09-13-p1-plugin m10): the alternative —
+		// silently swallowing a mistyped opt-in — makes a typo
+		// indistinguishable from a disabled plugin and would poison the A/B
+		// arms (§7) undetectably. config_rejected is the single sanctioned
+		// write in the net-all-off state; a DESIGN revision should name this
+		// exception explicitly instead of the current ambiguous wording.
 		const root = dataRoot(process.env);
 		const sessionId = safeSessionId(str(pick(payload, "session_id", "sessionId")) ?? "config");
 		await appendTrajectory(root, sessionId, {

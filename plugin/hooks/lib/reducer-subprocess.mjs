@@ -7,14 +7,15 @@
  *
  * Three tool-face defenses (DESIGN / PENDING-MERGES §3):
  *   1. isolated HOME (primary): the child's HOME points at a per-call
- *      rebuilt $ZCODE_PLUGIN_DATA/run/reducer-home containing ONLY a
+ *      rebuilt $ZCODE_PLUGIN_DATA/run/reducer-home-<runId> containing ONLY a
  *      `.zcode/cli/config.json` with `{provider, model}` copied programmatically
  *      from the host's `~/.zcode/cli/config.json` (credentials therefore remain
  *      Zcode's own configuration, C4). With no plugin registry under that HOME,
  *      no plugin and no user MCP server — including every sol-zcode tool —
  *      loads in the child, which also roots out re-entry.
- *   2. `--disallowed-tools` enumerating the built-in tools (verified working;
- *      `--allowed-tools` is a phantom flag, G18).
+ *   2. `--disallowed-tools` enumerating the built-in tools (BUILTIN_TOOL_NAMES,
+ *      runtime-verified against the zcode.cjs 0.16.5 registry; `--allowed-tools`
+ *      is a phantom flag, G18).
  *   3. `SOL_ZCODE_AUX=1` in the child env: hooks/MCP see it and go zero-behavior.
  *
  * The untrusted log travels via --attach (content verified to reach the model;
@@ -30,7 +31,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { reducerInputHeader, reducerInstructions } from "../../core/index.mjs";
@@ -38,26 +39,72 @@ import { reducerHomePath, runDir } from "./store.mjs";
 
 export const REDUCER_TIMEOUT_MS = 90_000;
 
-/** Built-in tool enumeration for the --disallowed-tools defense (runtime-verified set). */
+/**
+ * Built-in tool enumeration for the --disallowed-tools defense.
+ *
+ * Runtime-verified 2026-09-13 against the decompiled registry of the installed
+ * host (zcode.cjs 0.16.5, builtin tool Set + the tool-rule name canonicalizer):
+ * the registered built-ins are exactly Agent, AskUserQuestion, Bash, CronCreate,
+ * CronDelete, CronList, CronUpdate, Edit, EnterPlanMode, EnterWorktree,
+ * ExitPlanMode, ExitWorktree, Glob, Grep, LSP, NotebookEdit, Read,
+ * ScheduleWakeup, Skill, TaskCreate, TaskGet, TaskList, TaskOutput, TaskStop,
+ * TaskUpdate, TodoRead, TodoWrite, WebFetch, WebSearch, Workflow, Write.
+ * The CLI tool-rule parser additionally recognizes an alias list (ApplyPatch,
+ * GoalRead, ReadSessionContext, RespondToCoordinator, SendMessage, Task,
+ * web_search, js*); those aliases and a few cross-version names are kept below
+ * for forward/backward compatibility — a disallowed entry that matches no
+ * registered tool is inert (the filter is a plain name-set membership test).
+ * (Audit AUDIT_2026-09-13-p1-plugin M1: the previous list omitted Cron×4 and
+ * the Task* family while claiming to be runtime-verified.)
+ */
 export const BUILTIN_TOOL_NAMES = [
+	// Registered built-in tools in the zcode.cjs 0.16.5 runtime registry.
+	"Agent",
+	"AskUserQuestion",
 	"Bash",
-	"Read",
-	"Write",
+	"CronCreate",
+	"CronDelete",
+	"CronList",
+	"CronUpdate",
 	"Edit",
-	"MultiEdit",
+	"EnterPlanMode",
+	"EnterWorktree",
+	"ExitPlanMode",
+	"ExitWorktree",
 	"Glob",
 	"Grep",
-	"Agent",
-	"Task",
-	"TodoWrite",
+	"LSP",
+	"NotebookEdit",
+	"Read",
+	"ScheduleWakeup",
+	"Skill",
+	"TaskCreate",
+	"TaskGet",
+	"TaskList",
+	"TaskOutput",
+	"TaskStop",
+	"TaskUpdate",
 	"TodoRead",
+	"TodoWrite",
 	"WebFetch",
 	"WebSearch",
-	"Skill",
-	"AskUserQuestion",
-	"NotebookEdit",
-	"EnterPlanMode",
-	"ExitPlanMode",
+	"Workflow",
+	"Write",
+	// Alias names the host tool-rule parser canonicalizes (subagent-ported
+	// tools, the legacy Task name, the web_search alias, the browser-use REPL
+	// tools). Not in the registry Set, but real in some host configurations.
+	"ApplyPatch",
+	"GoalRead",
+	"ReadSessionContext",
+	"RespondToCoordinator",
+	"SendMessage",
+	"Task",
+	"web_search",
+	"js",
+	"js_reset",
+	"js_add_node_module_dir",
+	// Names from other/older host versions; inert if unregistered.
+	"MultiEdit",
 	"ListMcpResources",
 	"Memory",
 ];
@@ -115,9 +162,14 @@ export function validateModelInRegistry(config, model) {
 
 /**
  * Rebuild the isolated reducer HOME (per call; removed afterwards — P1 review
- * item ②). Returns { home, model } or throws with a fallback reason.
+ * item ②). Each call gets its own home directory (`reducer-home-<runId>`, audit
+ * m4): two concurrent host sessions sharing one plugin-data root can no longer
+ * `rm -rf` each other's HOME mid-run (the old shared `reducer-home` path let
+ * one finishing call delete the dir another call's child was still using →
+ * fail-open fallback to the unreduced log). Returns { home, model } or throws
+ * with a fallback reason.
  */
-export async function buildReducerHome(dataRoot, { reducerModel, env = process.env }) {
+export async function buildReducerHome(dataRoot, { reducerModel, runId = "default", env = process.env }) {
 	const hostConfigPath = hostCliConfigPath(env);
 	let hostConfig;
 	try {
@@ -131,7 +183,7 @@ export async function buildReducerHome(dataRoot, { reducerModel, env = process.e
 	const validation = validateModelInRegistry(hostConfig, model);
 	if (!validation.ok) throw new Error(validation.reason);
 
-	const home = reducerHomePath(dataRoot);
+	const home = reducerHomePath(dataRoot, runId);
 	await rm(home, { recursive: true, force: true });
 	const cliDir = join(home, ".zcode", "cli");
 	await mkdir(cliDir, { recursive: true, mode: 0o700 });
@@ -141,6 +193,40 @@ export async function buildReducerHome(dataRoot, { reducerModel, env = process.e
 		{ encoding: "utf8", mode: 0o600 },
 	);
 	return { home, model };
+}
+
+/** Host model from the host cli config, non-throwing (receipt-cache key input, audit m2). */
+export async function resolveHostModel(env = process.env) {
+	try {
+		const hostConfig = JSON.parse(await readFile(hostCliConfigPath(env), "utf8"));
+		return typeof hostConfig?.model === "string" && hostConfig.model.length > 0 ? hostConfig.model : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Crash-leftover reducer homes older than the sweep age (per-run dirs, audit m4). */
+const REDUCER_HOME_STALE_MS = 60 * 60 * 1000; // 1h ≫ 90s call timeout
+
+async function sweepStaleReducerHomes(dataRoot) {
+	const dir = runDir(dataRoot);
+	let entries;
+	try {
+		entries = await readdir(dir);
+	} catch {
+		return;
+	}
+	const now = Date.now();
+	for (const name of entries) {
+		if (!name.startsWith("reducer-home")) continue;
+		const path = join(dir, name);
+		try {
+			const stats = await stat(path);
+			if (now - stats.mtimeMs > REDUCER_HOME_STALE_MS) await rm(path, { recursive: true, force: true });
+		} catch {
+			// vanished or unreadable — nothing to sweep
+		}
+	}
 }
 
 function extractJsonObject(text) {
@@ -190,8 +276,9 @@ export async function callReducerSubprocess(dataRoot, { command, isError, archiv
 
 	let home;
 	let model;
+	const runId = randomUUID().slice(0, 8);
 	try {
-		({ home, model } = await buildReducerHome(dataRoot, { reducerModel, env }));
+		({ home, model } = await buildReducerHome(dataRoot, { reducerModel, runId, env }));
 	} catch (error) {
 		return {
 			errorMessage: error instanceof Error ? error.message : String(error),
@@ -203,6 +290,7 @@ export async function callReducerSubprocess(dataRoot, { command, isError, archiv
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
 		};
 	}
+	await sweepStaleReducerHomes(dataRoot).catch(() => undefined);
 
 	const tmpDir = join(runDir(dataRoot), "tmp");
 	await mkdir(tmpDir, { recursive: true, mode: 0o700 });
@@ -322,6 +410,8 @@ export async function callReducerSubprocess(dataRoot, { command, isError, archiv
 		};
 	} finally {
 		await rm(attachPath, { force: true }).catch(() => undefined);
-		await rm(reducerHomePath(dataRoot), { recursive: true, force: true }).catch(() => undefined);
+		// Remove only THIS call's home (audit m4): a concurrent call's
+		// reducer-home-<its-runId> must survive until its own finally.
+		await rm(reducerHomePath(dataRoot, runId), { recursive: true, force: true }).catch(() => undefined);
 	}
 }

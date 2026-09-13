@@ -18,7 +18,8 @@
  */
 
 import { createInterface } from "node:readline";
-import { callTool, createToolContext, toolDefinitions } from "./tools.mjs";
+import { callTool, createToolContext, refreshToolContextSession, toolDefinitions } from "./tools.mjs";
+import { appendTrajectory } from "../hooks/lib/store.mjs";
 
 const SERVER_INFO = { name: "sol", version: "0.1.0" };
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2024-11-05"];
@@ -37,7 +38,11 @@ function fail(id, code, message) {
 
 // Serialize tool calls: fused mutations rely on the per-file queue for
 // cross-process safety, but in-server serialization also keeps ledger ordering
-// deterministic.
+// deterministic. Accepted trade-off (AUDIT_2026-09-13-p1-plugin m3): one long
+// sol_bash (up to the 600s valve) delays concurrent obs_recall/sol_trajectory
+// calls from THIS server process. Cross-process ledger appends stay safe via
+// the O_EXCL chain lock either way; parallelizing read-only tools was judged
+// not worth the reordering risk for the evidence chain.
 let callChain = Promise.resolve();
 
 function enqueueToolCall(handler) {
@@ -71,7 +76,7 @@ async function handleRequest(ctxPromise, msg) {
 			return { tools: toolDefinitions(ctx) };
 		}
 		case "tools/call": {
-			const ctx = await ctxPromise;
+			let ctx = await ctxPromise;
 			const name = params?.name;
 			const args = params?.arguments ?? {};
 			if (ctx.cfg.zeroBehavior) {
@@ -80,6 +85,9 @@ async function handleRequest(ctxPromise, msg) {
 					isError: true,
 				};
 			}
+			// Session attribution is refreshed per call (audit m1): the pointer
+			// file may have appeared after this server process started.
+			ctx = await refreshToolContextSession(ctx);
 			const allowed = toolDefinitions(ctx).some((tool) => tool.name === name);
 			if (!allowed) {
 				return { content: [{ type: "text", text: `Tool not available under the current configuration: ${name}` }], isError: true };
@@ -92,9 +100,22 @@ async function handleRequest(ctxPromise, msg) {
 }
 
 async function main() {
-	// Context resolves config (mtime-cached) and the session pointer lazily but
-	// once per process start; tools/list and tools/call share it.
+	// Config resolves mtime-cached once per process; the session attribution is
+	// additionally refreshed on every tools/call (see handleRequest, audit m1).
 	const ctxPromise = createToolContext(process.env);
+	// config_rejected parity with the hook side (audit m12): a mistyped option
+	// key is journaled here too — the same sanctioned exception to the
+	// all-off-zero-files rule the hook dispatcher makes (see sol-hook.mjs, m10).
+	void ctxPromise.then((ctx) => {
+		if (ctx.cfg.status === "ok" && ctx.cfg.rejectedKeys.length > 0) {
+			return appendTrajectory(ctx.dataRoot, "config", {
+				event: "config_rejected",
+				status: "error",
+				detail: `keys=${ctx.cfg.rejectedKeys.join(",")};source=mcp`,
+			}).catch(() => undefined);
+		}
+		return undefined;
+	});
 	const rl = createInterface({ input: process.stdin });
 	rl.on("line", (line) => {
 		const trimmed = line.trim();

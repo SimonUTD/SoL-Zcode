@@ -87,18 +87,30 @@ export async function persistOccState(dataRoot, sessionId, state, reason) {
  * content-hash ids are synthesized (stable across cancelled-step removals);
  * OpenCode-style payloads with explicit ids pass through unchanged. Cancelled
  * steps are dropped.
+ *
+ * Duplicate-content todos would synthesize identical ids, which parsePlanSteps
+ * rejects → the whole plan update was silently dropped (audit m5). Occurrence
+ * suffixes (-2, -3, …) keep synthesized ids unique instead; the first
+ * occurrence keeps the bare hash id so id stability for the normal
+ * all-unique-content case is unchanged.
  */
 export function todosToPlan(todos) {
 	if (!Array.isArray(todos)) return undefined;
 	const steps = [];
+	const synthesized = new Map();
 	for (const todo of todos) {
 		if (typeof todo !== "object" || todo === null || Array.isArray(todo)) return undefined;
 		const goal = todo.content;
 		if (typeof goal !== "string") return undefined;
-		const id =
-			typeof todo.id === "string" && todo.id.length > 0
-				? todo.id
-				: `todo-${createHash("sha256").update(goal, "utf8").digest("hex").slice(0, 10)}`;
+		let id;
+		if (typeof todo.id === "string" && todo.id.length > 0) {
+			id = todo.id;
+		} else {
+			const base = `todo-${createHash("sha256").update(goal, "utf8").digest("hex").slice(0, 10)}`;
+			const seen = synthesized.get(base) ?? 0;
+			synthesized.set(base, seen + 1);
+			id = seen === 0 ? base : `${base}-${seen + 1}`;
+		}
 		const status = todo.status;
 		if (status === "cancelled") continue;
 		steps.push({
@@ -224,6 +236,12 @@ export async function runOccStopRound(dataRoot, sessionId, { observation, stopHo
 				reason:
 					"[sol-occ] Online context compaction finished. The parent task is still active. Before continuing work, call TodoWrite with a fresh plan for the remaining work.",
 			};
+		} else if (state.totalBlocks >= MAX_SESSION_BLOCKS) {
+			// Session budget permanently exhausted — the reminder can never be
+			// delivered; clear it instead of carrying it forever (audit m14).
+			// Temporary consecutive-budget exhaustion (reset by a natural Stop)
+			// keeps the reminder pending.
+			state.pendingCompactionReminder = false;
 		}
 	} else if (state.pendingBoundary && budgetAllows) {
 		const decision = decideCompaction({

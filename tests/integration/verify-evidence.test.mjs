@@ -6,7 +6,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { pluginRoot } from "./helpers.mjs";
@@ -16,10 +16,11 @@ import { createObservation, ensureStored } from "../../plugin/core/index.mjs";
 
 const SESSION = "sess_verify-1";
 
-async function runVerify(dataRoot) {
+async function runVerify(dataRoot, envOverrides = undefined) {
 	const result = await new Promise((resolve) => {
-		const child = spawn(process.execPath, [join(pluginRoot(), "scripts", "verify-evidence.mjs"), dataRoot], {
+		const child = spawn(process.execPath, [join(pluginRoot(), "scripts", "verify-evidence.mjs"), ...(dataRoot === null ? [] : [dataRoot])], {
 			stdio: ["ignore", "pipe", "pipe"],
+			env: envOverrides ?? process.env,
 		});
 		let stdout = "";
 		let stderr = "";
@@ -181,4 +182,27 @@ test("rewritten chain prefix vs anchor reports anchor-hash-mismatch", async () =
 test("usage error exits 2 for a nonexistent data root", async () => {
 	const result = await runVerify("/nonexistent/data-root-xyz");
 	assert.equal(result.code, 2);
+});
+
+test("argument-less default root matches the runtime store layout (m8)", async () => {
+	const store = await buildCleanStore();
+	// Simulate the real HOME layout: plugin data at
+	// ~/.zcode/cli/plugins/data/sol-zcode@sol-zcode-dev (store.mjs dataRoot).
+	const home = await mkdtemp(join(tmpdir(), "sol-home-"));
+	const defaultRoot = join(home, ".zcode", "cli", "plugins", "data", "sol-zcode@sol-zcode-dev");
+	await mkdir(dirname(defaultRoot), { recursive: true });
+	await (await import("node:fs/promises")).cp(store.dataRoot, defaultRoot, { recursive: true });
+	try {
+		const result = await runVerify(null, {
+			HOME: home,
+			PATH: process.env.PATH ?? "/usr/bin:/bin",
+			TMPDIR: tmpdir(),
+		});
+		assert.equal(result.code, 0, result.stdout + result.stderr);
+		assert.ok(result.stdout.includes(defaultRoot), "must resolve the sol-zcode@sol-zcode-dev default root");
+		assert.ok(result.stdout.includes("OK: all chains verified"));
+	} finally {
+		await rm(store.root, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
 });

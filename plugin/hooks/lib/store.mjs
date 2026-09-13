@@ -86,8 +86,14 @@ export function runDir(dataRootDir) {
 	return join(dataRootDir, "run");
 }
 
-export function reducerHomePath(dataRootDir) {
-	return join(runDir(dataRootDir), "reducer-home");
+/**
+ * Isolated reducer HOME for one subprocess call (audit m4: per-run dirs so
+ * concurrent calls under the same data root cannot delete each other's HOME).
+ * runId is an internally generated short uuid; the "default" id only exists
+ * for backwards compatibility of the signature.
+ */
+export function reducerHomePath(dataRootDir, runId = "default") {
+	return join(runDir(dataRootDir), `reducer-home-${runId}`);
 }
 
 export function sessionsDir(dataRootDir) {

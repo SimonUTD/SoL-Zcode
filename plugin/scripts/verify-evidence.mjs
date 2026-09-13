@@ -23,8 +23,8 @@
 
 import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { dataRoot } from "../hooks/lib/store.mjs";
 
 const GENESIS_HASH = "0".repeat(64);
 
@@ -100,11 +100,10 @@ async function verifyChainFile(path) {
 
 async function main() {
 	const argRoot = process.argv[2];
-	const root =
-		argRoot ??
-		(process.env.ZCODE_PLUGIN_DATA && process.env.ZCODE_PLUGIN_DATA.length > 0
-			? process.env.ZCODE_PLUGIN_DATA
-			: join(homedir(), ".zcode", "cli", "plugins", "data", "sol-zcode"));
+	// Same default root as the runtime store (store.mjs dataRoot): $ZCODE_PLUGIN_DATA,
+	// else ~/.zcode/cli/plugins/data/sol-zcode@sol-zcode-dev (audit m8 — a
+	// previous local fallback used the bare "sol-zcode" id and diverged).
+	const root = argRoot ?? dataRoot(process.env);
 	let rootStat;
 	try {
 		rootStat = await stat(root);

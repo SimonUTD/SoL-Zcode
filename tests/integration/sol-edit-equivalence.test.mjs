@@ -10,6 +10,14 @@
  * replace_all opt-in) exercised through the tool implementations in
  * plugin/mcp/tools.mjs under a real filesystem. Headless live-model
  * equivalence runs in P2 e2e.
+ *
+ * KNOWN GAP, EXPLICITLY DEFERRED TO P2 (AUDIT_2026-09-13-p1-plugin m9, P1
+ * deviation #11): the built-ins' Read-before-Edit *session tracking* (Edit/Write
+ * refusing a file the session has not Read first) is NOT replicated here — the
+ * "read-before-write" case below pins only the weaker file-must-exist +
+ * exact-match contract. Replicating it needs host-side Read observation
+ * (PreToolUse/PostToolUse state), which is P2 scope together with the
+ * live-model equivalence run.
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -122,7 +130,7 @@ test("sol_edit rejects empty old_string and old==new", async () => {
 	});
 });
 
-test("sol_edit errors on a nonexistent file (read-before-write)", async () => {
+test("sol_edit errors on a nonexistent file (weaker 'read-before-write': file must exist)", async () => {
 	await withCtx({ actionFusion: true }, async (ctx, project) => {
 		const result = await solEdit(ctx, {
 			file_path: join(project, "missing.txt"),
@@ -130,6 +138,17 @@ test("sol_edit errors on a nonexistent file (read-before-write)", async () => {
 		});
 		assert.equal(result.isError, true);
 		assert.match(result.content[0].text, /File does not exist/);
+		// m9 gap marker: sol_edit does NOT require a prior session Read of an
+		// EXISTING file (built-in Edit does). Adding that needs host-side Read
+		// observation — P2 (see file header).
+		const untouched = join(project, "never-read.txt");
+		const { writeFile } = await import("node:fs/promises");
+		await writeFile(untouched, "content\n", "utf8");
+		const noPriorRead = await solEdit(ctx, {
+			file_path: untouched,
+			edits: [{ old_string: "content", new_string: "edited" }],
+		});
+		assert.equal(noPriorRead.isError, false, "P1 contract: existence + exact match only");
 	});
 });
 

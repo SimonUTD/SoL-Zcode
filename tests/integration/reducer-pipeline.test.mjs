@@ -21,7 +21,6 @@ import {
 	validateModelInRegistry,
 } from "../../plugin/hooks/lib/reducer-subprocess.mjs";
 import { archiveBody } from "../../plugin/core/index.mjs";
-import { reducerHomePath } from "../../plugin/hooks/lib/store.mjs";
 
 const BIG_LOG = [
 	"error: compilation failed",
@@ -123,14 +122,45 @@ test("diagnostic gate + receipt pipeline through sol_bash (cargo build, exit 1)"
 			[...BUILTIN_TOOL_NAMES].sort().join(","),
 			"--disallowed-tools enumeration",
 		);
+		// Audit M1 regression pin: the runtime-registered tools found missing in
+		// the audit (Cron×4, the Task* family, LSP, Workflow, ...) must be part
+		// of the enumeration the child actually received.
+		for (const required of [
+			"CronCreate",
+			"CronDelete",
+			"CronList",
+			"CronUpdate",
+			"TaskCreate",
+			"TaskGet",
+			"TaskList",
+			"TaskOutput",
+			"TaskStop",
+			"TaskUpdate",
+			"EnterWorktree",
+			"ExitWorktree",
+			"LSP",
+			"ScheduleWakeup",
+			"Workflow",
+			"SendMessage",
+			"ReadSessionContext",
+			"RespondToCoordinator",
+		]) {
+			assert.ok(diagnostics.disallowedTools.split(",").includes(required), `${required} must be disallowed`);
+		}
 		assert.notEqual(diagnostics.home, fixture.env.HOME, "isolated HOME");
 		assert.ok(diagnostics.home.includes("reducer-home"));
 		assert.equal(diagnostics.homeCliConfigExists, true, "isolated home has its own cli config");
 		assert.ok(diagnostics.attachBytes > 4096, "log traveled via --attach");
 		assert.ok(diagnostics.promptLength < 8192, "prompt stays small (no log inline)");
 
-		// reducer-home cleaned up after the call.
-		assert.equal(existsSync(reducerHomePath(fixture.dataDir)), false);
+		// Reducer-home cleaned up after the call (m4: per-run dirs — no
+		// reducer-home-* leftovers at all).
+		const runEntries = await readdir(join(fixture.dataDir, "run")).catch(() => []);
+		assert.deepEqual(
+			runEntries.filter((name) => name.startsWith("reducer-home")),
+			[],
+			"no reducer-home leftovers",
+		);
 	});
 });
 
@@ -201,6 +231,161 @@ test("buildReducerHome copies the provider registry, validates the model, and ca
 			/reducer-model-not-in-registry/,
 		);
 		await rm(home, { recursive: true, force: true });
+	});
+});
+
+test("concurrent calls get distinct reducer homes and cannot delete each other's (m4)", async () => {
+	await withFixture({ options: { evidenceReducer: true } }, async (fixture) => {
+		// Two homes built for different runIds coexist: one call's cleanup can
+		// never remove the dir another call's child process is using (the old
+		// single shared `reducer-home` path allowed exactly that).
+		const first = await buildReducerHome(fixture.dataDir, { runId: "aaaa1111", env: fixture.env });
+		const second = await buildReducerHome(fixture.dataDir, { runId: "bbbb2222", env: fixture.env });
+		assert.notEqual(first.home, second.home);
+		assert.equal(existsSync(first.home), true);
+		assert.equal(existsSync(second.home), true);
+		// Simulate the first call finishing while the second is still running.
+		await rm(first.home, { recursive: true, force: true });
+		assert.equal(existsSync(second.home), true, "the concurrent call's home must survive");
+		await rm(second.home, { recursive: true, force: true });
+
+		// And two concurrent full subprocess calls both succeed with no leftovers.
+		const archive = await archiveBody(join(fixture.dataDir, "store", "reducer"), "error: x\n" + "d\n".repeat(2048));
+		const results = await Promise.all([
+			callReducerSubprocess(fixture.dataDir, {
+				command: "cargo build",
+				isError: true,
+				archive,
+				body: "error: x\n" + "d\n".repeat(2048),
+				reducerModel: "",
+				env: fixture.env,
+			}),
+			callReducerSubprocess(fixture.dataDir, {
+				command: "cargo test",
+				isError: true,
+				archive,
+				body: "error: x\n" + "d\n".repeat(2048),
+				reducerModel: "",
+				env: fixture.env,
+			}),
+		]);
+		for (const result of results) assert.equal(result.ok, true, result.errorMessage);
+		const runEntries = await readdir(join(fixture.dataDir, "run")).catch(() => []);
+		assert.deepEqual(
+			runEntries.filter((name) => name.startsWith("reducer-home")),
+			[],
+			"both per-run homes cleaned up",
+		);
+	});
+});
+
+test("receipt cache key follows the resolved host model, not a placeholder (m2)", async () => {
+	await withFixture({ options: { evidenceReducer: true } }, async (fixture) => {
+		const { resolveHostModel } = await import("../../plugin/hooks/lib/reducer-subprocess.mjs");
+		assert.equal(await resolveHostModel(fixture.env), "builtin:bigmodel-coding-plan/GLM-5.3-Flash");
+
+		const logFile = join(fixture.env.ZCODE_PROJECT_DIR, "log-m2.txt");
+		await writeFile(logFile, `${BIG_LOG}\n`, "utf8");
+		const command = `cargo build 2>&1; sh -c 'cat "${logFile}"; exit 1'`;
+
+		// One persistent server process (the receipt cache is per-process):
+		//   call 1 (model Flash)  → miss (cold cache)
+		//   call 2 same model     → HIT  (caching works at all)
+		//   [host switches model to GLM-5.3]
+		//   call 3 same command   → MISS (the model participates in the key —
+		//                            the old placeholder key reused the receipt
+		//                            across models, audit m2)
+		const child = spawn(process.execPath, [join(pluginRoot(), "mcp", "server.mjs")], {
+			env: { ...fixture.env },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let callCount = 0;
+		const call = () => {
+			callCount += 1;
+			child.stdin.write(
+				`${JSON.stringify({ jsonrpc: "2.0", id: callCount, method: "tools/call", params: { name: "sol_bash", arguments: { command } } })}\n`,
+			);
+		};
+		const seen = [];
+		let buffer = "";
+		const response = (id) => new Promise((resolve) => {
+			const poll = setInterval(() => {
+				const hit = seen.find((message) => message.id === id && message.result !== undefined);
+				if (hit !== undefined) {
+					clearInterval(poll);
+					resolve(hit);
+				}
+			}, 20);
+			setTimeout(() => {
+				clearInterval(poll);
+				resolve(undefined);
+			}, 60_000);
+		});
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			buffer += chunk;
+			let index;
+			while ((index = buffer.indexOf("\n")) >= 0) {
+				const line = buffer.slice(0, index);
+				buffer = buffer.slice(index + 1);
+				if (line.trim().length === 0) continue;
+				seen.push(JSON.parse(line));
+			}
+		});
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", () => undefined);
+		try {
+			call();
+			const first = await response(1);
+			assert.ok(first?.result?.content?.[0]?.text?.startsWith("sol_zcode_evidence_receipt_v1"));
+			call();
+			const second = await response(2);
+			assert.ok(second?.result?.content?.[0]?.text?.startsWith("sol_zcode_evidence_receipt_v1"));
+
+			const configPath = fixture.env.SOL_ZCODE_CONFIG_PATH;
+			const config = JSON.parse(await readFile(configPath, "utf8"));
+			config.model = "builtin:bigmodel-coding-plan/GLM-5.3";
+			await new Promise((resolve) => setTimeout(resolve, 25)); // distinct mtime
+			await writeFile(configPath, JSON.stringify(config), "utf8");
+
+			call();
+			const third = await response(3);
+			assert.ok(third?.result?.content?.[0]?.text?.startsWith("sol_zcode_evidence_receipt_v1"));
+		} finally {
+			child.stdin.end();
+			await new Promise((resolve) => child.on("close", resolve));
+		}
+
+		const applied = (await readFile(join(fixture.dataDir, "store", "ledger", "mcp-direct", "reducer.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line))
+			.filter((entry) => entry.event === "applied");
+		assert.equal(applied.length, 3);
+		assert.equal(applied[0].cacheHit, false, "cold cache");
+		assert.equal(applied[1].cacheHit, true, "same model + same input reuses the receipt");
+		assert.equal(applied[2].cacheHit, false, "host model change must invalidate the receipt cache");
+	});
+});
+
+test("fused failure keeps the mutation-applied Note even after the log body is reduced (m11)", async () => {
+	await withFixture({ options: { actionFusion: true, evidenceReducer: true } }, async (fixture) => {
+		const logFile = join(fixture.env.ZCODE_PROJECT_DIR, "log-m11.txt");
+		await writeFile(logFile, `${BIG_LOG}\n`, "utf8");
+		const response = await mcpCall(fixture, "sol_write", {
+			file_path: "src-m11.c",
+			content: "int main(){}\n",
+			then_run: { command: `cargo build 2>&1; sh -c 'cat "${logFile}"; exit 1'` },
+		});
+		assert.equal(response.result.isError, true);
+		const text = response.result.content[0].text;
+		const markerIndex = text.indexOf("[then_run:failed]");
+		assert.ok(markerIndex > 0);
+		// The receipt replaced the log body AFTER the marker...
+		assert.ok(text.slice(markerIndex).includes("sol_zcode_evidence_receipt_v1"), "body replaced by receipt");
+		// ...and the adapter's mutation-applied Note survived the reduction
+		// (it now sits in the retained prefix, before the marker).
+		assert.ok(text.includes("Note: the file mutation above was applied"), "Note must survive reduction");
 	});
 });
 

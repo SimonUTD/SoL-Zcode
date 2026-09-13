@@ -46,7 +46,7 @@ import {
 import { evaluateReducerGates } from "../core/reducer/policy.mjs";
 import { appendChained } from "../hooks/lib/chain.mjs";
 import { resolveConfig } from "../hooks/lib/config.mjs";
-import { callReducerSubprocess } from "../hooks/lib/reducer-subprocess.mjs";
+import { callReducerSubprocess, resolveHostModel } from "../hooks/lib/reducer-subprocess.mjs";
 import {
 	dataRoot,
 	observationLedgerPath,
@@ -74,6 +74,20 @@ export async function createToolContext(env = process.env) {
 	const root = dataRoot(env);
 	const session = await resolveMcpSession(root, env);
 	return { env, cfg, dataRoot: root, session };
+}
+
+/**
+ * Re-resolve the session attribution against the current pointer files.
+ * The context is built once at server start, but the pointer may be published
+ * by the first hook event AFTER the MCP server was spawned (V7-①: MCP children
+ * get no session env); without a refresh the whole session's ledger writes
+ * would stick to the mcp-direct fallback (audit m1).
+ */
+export async function refreshToolContextSession(ctx) {
+	if (ctx.env.ZCODE_SESSION_ID && ctx.env.ZCODE_SESSION_ID.length > 0) return ctx;
+	const session = await resolveMcpSession(ctx.dataRoot, ctx.env);
+	if (session.sessionId === ctx.session.sessionId && session.cwd === ctx.session.cwd) return ctx;
+	return { ...ctx, session };
 }
 
 function ok(text) {
@@ -267,12 +281,19 @@ async function runFusedFollowUp(ctx, absolutePath, thenRun) {
 export async function runReducerPipeline(ctx, { command, body, isError, toolCallId }) {
 	if (!ctx.cfg.evidenceReducer) return null;
 	try {
+		// The receipt-cache key must cover the model that will actually run the
+		// reduction. When reducerModel is unset the subprocess inherits the
+		// HOST model (buildReducerHome), so resolve it here too — a static
+		// placeholder would let a host that switches models mid-session reuse
+		// receipts across models (audit m2; upstream policy.ts invariant:
+		// "every input that could change the receipt participates").
+		const reducerModelForCache =
+			typeof ctx.cfg.reducerModel === "string" && ctx.cfg.reducerModel.length > 0
+				? ctx.cfg.reducerModel
+				: ((await resolveHostModel(ctx.env)) ?? "zcode-host-default");
 		const config = loadReducerConfig(ctx.dataRoot, {
 			reducerProvider: "zcode-headless",
-			reducerModel:
-				typeof ctx.cfg.reducerModel === "string" && ctx.cfg.reducerModel.length > 0
-					? ctx.cfg.reducerModel
-					: "zcode-host-default",
+			reducerModel: reducerModelForCache,
 			storeRoot: reducerStoreRoot(ctx.dataRoot),
 		});
 		const ledger = async (entry) => {
@@ -407,8 +428,12 @@ function fusedText(mutationResult, outcome) {
 		return { text: `${mutationResult}\n\n${THEN_RUN_SUCCEEDED}\n${outcome.output}`, isError: false };
 	}
 	if (outcome.status === "failed") {
+		// The Note sits BEFORE the marker line so the reducer's body split
+		// (everything after the marker is replaced by the receipt) cannot
+		// swallow it; the mutation confirmation and the Note together form the
+		// retained prefix, the command log is the reducible body (audit m11).
 		return {
-			text: `${mutationResult}\n\n${THEN_RUN_FAILED}\n${outcome.error}\n\nNote: the file mutation above was applied; only the follow-up command failed.`,
+			text: `${mutationResult}\n\nNote: the file mutation above was applied; only the follow-up command failed.\n\n${THEN_RUN_FAILED}\n${outcome.error}`,
 			isError: true,
 		};
 	}

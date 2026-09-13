@@ -115,7 +115,7 @@ test("SessionStart with only trajectory on: no additionalContext, but trajectory
 	}
 });
 
-test("PreToolUse gate: Write/Edit exit 2 with stderr reason; other tools pass", async () => {
+test("PreToolUse gate: Write/Edit/MultiEdit/NotebookEdit exit 2; other tools pass", async () => {
 	const fixture = await makeEnv({ options: { actionFusionGate: true } });
 	try {
 		const blocked = await runHook(fixture, basePayload("PreToolUse", { tool_name: "Write", tool_input: {} }));
@@ -123,12 +123,20 @@ test("PreToolUse gate: Write/Edit exit 2 with stderr reason; other tools pass", 
 		assert.equal(blocked.stdout, "");
 		assert.ok(blocked.stderr.includes("use sol_write / sol_edit"));
 
-		const blockedEdit = await runHook(fixture, basePayload("PreToolUse", { tool_name: "Edit", tool_input: {} }));
-		assert.equal(blockedEdit.code, 2);
+		// m6: every file-mutating built-in is gated, not just DESIGN §2.1's
+		// literal Write|Edit (MultiEdit/ApplyPatch for cross-version hosts,
+		// NotebookEdit registered in 0.16.5).
+		for (const tool of ["Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"]) {
+			const result = await runHook(fixture, basePayload("PreToolUse", { tool_name: tool, tool_input: {} }));
+			assert.equal(result.code, 2, `${tool} must be gated`);
+		}
 
-		const allowed = await runHook(fixture, basePayload("PreToolUse", { tool_name: "Bash", tool_input: {} }));
-		assert.equal(allowed.code, 0);
-		assert.equal(allowed.stdout, "");
+		// Non-mutating tools pass even with the gate on.
+		for (const tool of ["Bash", "Read", "Grep", "TodoWrite", "Skill"]) {
+			const result = await runHook(fixture, basePayload("PreToolUse", { tool_name: tool, tool_input: {} }));
+			assert.equal(result.code, 0, `${tool} must pass`);
+			assert.equal(result.stdout, "");
+		}
 	} finally {
 		await cleanup(fixture);
 	}
@@ -137,7 +145,10 @@ test("PreToolUse gate: Write/Edit exit 2 with stderr reason; other tools pass", 
 test("PostToolUse archives a large native Bash output and ledgers a native event", async () => {
 	const fixture = await makeEnv({ options: { observationPack: true } });
 	try {
-		const big = Array.from({ length: 500 }, (_v, i) => `native line ${i} ${"z".repeat(30)}\n`).join("");
+		// ≥30000 chars so the stdout fallback sits at the host truncation
+		// threshold (G6) with no persisted file available.
+		const big = Array.from({ length: 800 }, (_v, i) => `native line ${i} ${"z".repeat(30)}\n`).join("");
+		assert.ok(big.length > 30_000);
 		const result = await runHook(fixture, basePayload("PostToolUse", {
 			tool_name: "Bash",
 			toolName: "Bash",
@@ -159,6 +170,11 @@ test("PostToolUse archives a large native Bash output and ledgers a native event
 		const entry = JSON.parse(ledger.trim());
 		assert.equal(entry.event, "native");
 		assert.equal(entry.tool, "Bash");
+		// m7: no persistedOutputPath and stdout at the 30000-char truncation
+		// threshold → the ledger flags that the archived text may be truncated
+		// instead of silently recording it as the full output.
+		assert.equal(entry.source, "stdout");
+		assert.equal(entry.possiblyTruncated, true);
 	} finally {
 		await cleanup(fixture);
 	}
@@ -182,6 +198,11 @@ test("PostToolUse prefers the persisted full output over truncated stdout (G6)",
 		const objectsDir = join(fixture.dataDir, "store", "observation-pack", "objects");
 		const objects = await readdir(objectsDir);
 		assert.equal(await readFile(join(objectsDir, objects[0]), "utf8"), full);
+		// m7: persisted-source archives carry no truncation suspicion flags.
+		const ledger = await readFile(join(fixture.dataDir, "store", "ledger", SESSION, "observation.jsonl"), "utf8");
+		const entry = JSON.parse(ledger.trim());
+		assert.equal(entry.source, undefined);
+		assert.equal(entry.possiblyTruncated, undefined);
 	} finally {
 		await cleanup(fixture);
 	}

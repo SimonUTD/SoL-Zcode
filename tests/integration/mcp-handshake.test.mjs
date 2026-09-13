@@ -249,6 +249,34 @@ test("sol_trajectory stats/recent answer over the chained trajectory file", asyn
 	});
 });
 
+test("session attribution refreshes when a pointer appears after server start (m1)", async () => {
+	const fixture = await makeEnv({ options: { trajectory: true } });
+	await mkdir(join(fixture.env.ZCODE_PROJECT_DIR), { recursive: true });
+	// NO pointer file yet when the server spawns — the start-time resolution
+	// would stick to the mcp-direct fallback for the whole session.
+	await withServer(fixture, async (client, fx) => {
+		await handshake(client);
+		const direct = await client.request("tools/call", { name: "sol_trajectory", arguments: { action: "stats" } });
+		assert.ok(direct.result.content[0].text.includes("No trajectory records"), "mcp-direct: no records yet");
+
+		// The first hook event publishes the pointer (cwd matches the project).
+		const { appendTrajectory, sessionsDir } = await import("../../plugin/hooks/lib/store.mjs");
+		await appendTrajectory(fx.dataDir, "sess_late-pointer-1", { event: "session_start", status: "ok" });
+		await mkdir(sessionsDir(fx.dataDir), { recursive: true });
+		await writeFile(
+			join(sessionsDir(fx.dataDir), "sess_late-pointer-1.json"),
+			JSON.stringify({ sessionId: "sess_late-pointer-1", cwd: fx.env.ZCODE_PROJECT_DIR, ts: new Date().toISOString() }),
+			"utf8",
+		);
+
+		const attributed = await client.request("tools/call", { name: "sol_trajectory", arguments: { action: "stats" } });
+		assert.ok(
+			attributed.result.content[0].text.includes("session_start: 1"),
+			`later call must attribute to the pointer session, got: ${attributed.result.content[0].text}`,
+		);
+	});
+});
+
 test("unknown method returns JSON-RPC method-not-found", async () => {
 	const fixture = await makeEnv({ options: { trajectory: true } });
 	await withServer(fixture, async (client) => {

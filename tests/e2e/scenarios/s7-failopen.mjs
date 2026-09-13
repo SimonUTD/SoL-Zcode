@@ -51,13 +51,15 @@ export async function run({ deadline } = {}) {
 		notes.response = (run1.response ?? "").slice(0, 300);
 
 		// The FULL text reached the model: middle lines exist only in the full
-		// text. Evidence source is the rollout request messages (the Stop-time
-		// transcript holds only the last assistant message — S3/S4 P2 finding).
-		const { findRollout, rolloutFindString } = await import("../lib/harness.mjs");
+		// text. Evidence source is the rollout REQUEST messages (the Stop-time
+		// transcript holds only the last assistant message — S3/S4 P2 finding);
+		// requestOnly (m4) pins the request side so a response-side echo can
+		// never satisfy this claim.
+		const { findRollout, rolloutFindString, verifyEvidence } = await import("../lib/harness.mjs");
 		const rollout = await findRollout(sc, run1.sessionId);
-		const toolResultText = rollout === null ? null : await rolloutFindString(rollout, "1499\n1500\n1501");
+		const toolResultText = rollout === null ? null : await rolloutFindString(rollout, "1499\n1500\n1501", { requestOnly: true });
 		const fullTextSeen = toolResultText !== null && toolResultText.includes("2999\n3000\n") && toolResultText.includes("1\n2\n3\n");
-		const placeholderSeen = rollout !== null && (await rolloutFindString(rollout, "large tool result replaced")) !== null;
+		const placeholderSeen = rollout !== null && (await rolloutFindString(rollout, "large tool result replaced", { requestOnly: true })) !== null;
 		notes.rollout = rollout;
 		notes.fullTextSeen = fullTextSeen;
 		notes.placeholderSeen = placeholderSeen;
@@ -84,6 +86,22 @@ export async function run({ deadline } = {}) {
 		// The model could only answer MIDDLE correctly from the full text.
 		const answer = run1.response ?? "";
 		assertions.check("model answered LAST=3000 from the full output", /LAST=3000/i.test(answer), answer.split("\n")[2] ?? "");
+
+		// C3↔e2e closure (audit m3): the integrity CLI over the real data root —
+		// the fail-open fallback ledger (event "full" + EACCES reason) must still
+		// be a clean hash chain, and no unreconciled object may exist (the
+		// chmod-000 store accepted none).
+		const verify = verifyEvidence(sc.dataRoot);
+		notes.verifyEvidence = {
+			code: verify.code,
+			signal: verify.signal,
+			tail: verify.stdout.trim().split("\n").at(-1) ?? "",
+		};
+		assertions.check(
+			"verify-evidence over the scenario data root: exit 0, all chains verified",
+			verify.code === 0 && verify.stdout.includes("OK: all chains verified"),
+			`code=${verify.code} ${notes.verifyEvidence.tail} ${verify.stderr.slice(0, 200)}`,
+		);
 
 		await recordResult(id, {
 			status: assertions.ok ? "pass" : "fail",

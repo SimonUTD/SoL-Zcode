@@ -33,8 +33,8 @@
 import { createHash } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { DEFAULT_COMPACTION_ECONOMICS, analyzePlanTransition, decideCompaction, parsePlanSteps } from "../../core/index.mjs";
-import { appendChained } from "./chain.mjs";
-import { occHistoryPath, occStatePath } from "./store.mjs";
+import { appendChained, withPluginLock } from "./chain.mjs";
+import { occHistoryPath, occStatePath, safeSessionId } from "./store.mjs";
 
 export const MEMO_TOKENS = 1_000;
 export const KEEP_RECENT_TOKENS = 20_000;
@@ -55,6 +55,24 @@ export const CHARS_PER_TOKEN = 4;
 export const SYSTEM_BASELINE_TOKENS = 12_000;
 
 const OCC_STATE_SCHEMA = "sol_zcode_online_context_compact/1";
+
+/**
+ * Serialize every occ-state read-modify-write section under a per-session
+ * O_EXCL lock (audit m1): the host executes same-step tool calls in parallel,
+ * so concurrent PostToolUse/Stop/UserPromptSubmit hook processes race on the
+ * occ-state.json snapshot (lost accumulate; narrow interleavings could even
+ * roll back the block counters a late writer persisted). persistOccState does
+ * NOT take this lock itself — all mutation entry points below wrap their whole
+ * load→mutate→persist section in withOccStateLock. Readers (loadOccState)
+ * stay lock-free: the snapshot advances via tmp+rename, so a reader sees
+ * either the old or the new value, never a torn one (a briefly stale read is
+ * fail-safe — the next mutation re-reads under the lock).
+ */
+function withOccStateLock(dataRoot, sessionId, fn) {
+	// safeSessionId keeps the lock name inside run/locks even for a caller
+	// that has not sanitized yet (all hook call sites already pass safe ids).
+	return withPluginLock(dataRoot, `occ-state-${safeSessionId(sessionId)}`, fn);
+}
 
 export function initialOccState() {
 	return {
@@ -93,33 +111,50 @@ export async function loadOccState(dataRoot, sessionId) {
 	}
 }
 
-/** Append the new state to the chained history, then overwrite the snapshot. */
+/**
+ * Append the new state to the chained history, then overwrite the snapshot.
+ * Callers must hold the occ-state lock (withOccStateLock); the history append
+ * takes its own per-ledger lock, always nested INSIDE the state lock (single
+ * nesting order → no deadlock).
+ *
+ * Nano fix: when appendChained returns null (its own lock timed out) the
+ * snapshot is NOT advanced — the hash-chained history line is the durable
+ * record, and a snapshot ahead of the history would be an undetectable gap.
+ * Skipping the rename drops this update from the snapshot (fail-safe
+ * under-count), never fabricating state the history cannot vouch for.
+ */
 export async function persistOccState(dataRoot, sessionId, state, reason) {
-	await appendChained(dataRoot, occHistoryPath(dataRoot, sessionId), {
+	const appended = await appendChained(dataRoot, occHistoryPath(dataRoot, sessionId), {
 		event: "state",
 		reason: typeof reason === "string" ? reason : "update",
 		state,
 	});
+	if (appended === null) return null;
 	const tmp = `${occStatePath(dataRoot, sessionId)}.tmp-${process.pid}`;
 	await writeFile(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
 	await rename(tmp, occStatePath(dataRoot, sessionId));
+	return appended;
 }
 
 /**
  * Cumulative estimator feed (G21): add one hook-visible context volume —
  * UserPromptSubmit prompt bytes, PostToolUse tool_response bytes, Stop
  * last_assistant_message bytes — to occ-state. Hooks are separate processes;
- * occ-state.json is the shared blackboard, so every event loads→adds→persists.
+ * occ-state.json is the shared blackboard, so every event loads→adds→persists
+ * under the per-session state lock (audit m1: parallel same-step tool calls
+ * make concurrent PostToolUse hook processes a real interleaving).
  * tokens = bytes/4 (CHARS_PER_TOKEN, same convention as the vendor
  * observation pack).
  */
 export async function accumulateOccUsage(dataRoot, sessionId, bytes, kind) {
-	const state = await loadOccState(dataRoot, sessionId);
-	const add = Number.isFinite(bytes) ? Math.max(0, Math.floor(bytes)) : 0;
-	state.cumulativeBytes += add;
-	state.estimatedTokens = Math.ceil(state.cumulativeBytes / CHARS_PER_TOKEN);
-	await persistOccState(dataRoot, sessionId, state, `usage:${typeof kind === "string" && kind.length > 0 ? kind : "event"}`);
-	return state;
+	return withOccStateLock(dataRoot, sessionId, async () => {
+		const state = await loadOccState(dataRoot, sessionId);
+		const add = Number.isFinite(bytes) ? Math.max(0, Math.floor(bytes)) : 0;
+		state.cumulativeBytes += add;
+		state.estimatedTokens = Math.ceil(state.cumulativeBytes / CHARS_PER_TOKEN);
+		await persistOccState(dataRoot, sessionId, state, `usage:${typeof kind === "string" && kind.length > 0 ? kind : "event"}`);
+		return state;
+	});
 }
 
 /**
@@ -134,6 +169,114 @@ export function resolveContextWindowTokens({ payloadWindow, env = process.env } 
 	const fromEnv = Number(env.SOL_ZCODE_OCC_WINDOW_TOKENS);
 	if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
 	return undefined;
+}
+
+// ---------------------------------------------------------------- m2 calibration
+
+/**
+ * Head-preview chars the host keeps in the model-visible persisted-output
+ * envelope (zcode 0.16.5 REr: previewChars 2e3; G7 measured ~2 KB). The
+ * envelope shape (verified against the decompiled host formatter):
+ *
+ *   <persisted-output>
+ *   Output too large (<KB>). Full output saved to: <path>
+ *
+ *   Preview (first 2 KB):
+ *   <first 2000 chars of the output>
+ *   ...
+ *   </persisted-output>
+ */
+export const PERSISTED_PREVIEW_CHARS = 2000;
+
+/** Host byte formatter (N7o): "<n> B" / "<round(n/1e3)> KB" / ... */
+function formatKb(bytes) {
+	if (bytes < 1000) return `${bytes} B`;
+	if (bytes < 1_000_000) return `${Math.round(bytes / 1000)} KB`;
+	if (bytes < 1_000_000_000) return `${Math.round(bytes / 1_000_000)} MB`;
+	return `${Math.round(bytes / 1_000_000_000)} GB`;
+}
+
+function byteLength(text) {
+	return Buffer.byteLength(text, "utf8");
+}
+
+/** Model-visible size of one native output stream (G7): full bytes when the
+ * stream was delivered intact, the persisted-output envelope when truncated. */
+function nativeStreamModelBytes(response, stream) {
+	const truncated = response[`${stream}Truncated`] === true;
+	const bytesField = Number.isFinite(response[`${stream}Bytes`]) ? Math.max(0, Math.floor(response[`${stream}Bytes`])) : null;
+	const text = typeof response[stream] === "string" ? response[stream] : "";
+	if (!truncated) return bytesField ?? byteLength(text);
+	// Truncated: the model keeps only the host envelope — head preview (~2 KB)
+	// plus the notice carrying the byte count and the persisted path (audit m2;
+	// the full stdoutBytes never entered the context). The payload stream text
+	// is itself host-truncated (30000 chars, G6) but always covers the first
+	// PERSISTED_PREVIEW_CHARS of the original. Preview is cut at the char cap;
+	// the host also trims back to the last newline (±1 line — estimator-grade).
+	const total = bytesField ?? byteLength(text);
+	const path =
+		stream === "stdout"
+			? typeof response.persistedOutputPath === "string" && response.persistedOutputPath.length > 0
+				? response.persistedOutputPath
+				: typeof response.stdoutPersistedOutputPath === "string"
+					? response.stdoutPersistedOutputPath
+					: ""
+			: typeof response.stderrPersistedOutputPath === "string"
+				? response.stderrPersistedOutputPath
+				: "";
+	const envelope = [
+		"<persisted-output>",
+		`Output too large (${formatKb(total)}). Full output saved to: ${path}`,
+		"",
+		"Preview (first 2 KB):",
+		text.slice(0, PERSISTED_PREVIEW_CHARS),
+		"...",
+		"</persisted-output>",
+	].join("\n");
+	return byteLength(envelope);
+}
+
+/**
+ * G21 cumulative estimator input: the PostToolUse tool_response volume AS
+ * DELIVERED TO THE MODEL (audit m2 calibration — the old version counted full
+ * stdoutBytes even when the model only ever saw the ~2 KB host preview, a
+ * systematic over-estimate in the premature-compaction direction):
+ *   - native Bash-shaped responses: stdoutBytes+stderrBytes when neither stream
+ *     is truncated (delivered intact); per-stream persisted-output envelope
+ *     estimate when truncated (G6/G7);
+ *   - MCP tool responses ({content:[{type:"text",text}]} or plain strings):
+ *     the text IS what the model sees — sol_* placeholders included, so no
+ *     removedTokens adjustment is needed (the archived full output never
+ *     enters the context);
+ *   - other structured responses: stringified size (envelope-only over-count).
+ */
+export function occToolResponseBytes(toolResponse) {
+	if (toolResponse === undefined || toolResponse === null) return 0;
+	if (typeof toolResponse === "string") return byteLength(toolResponse);
+	if (typeof toolResponse !== "object" || Array.isArray(toolResponse)) {
+		try {
+			return byteLength(JSON.stringify(toolResponse));
+		} catch {
+			return 0;
+		}
+	}
+	if (Array.isArray(toolResponse.content)) {
+		let total = 0;
+		for (const part of toolResponse.content) {
+			if (part !== null && typeof part === "object" && !Array.isArray(part) && typeof part.text === "string") {
+				total += byteLength(part.text);
+			}
+		}
+		if (total > 0) return total;
+	}
+	if (Number.isFinite(toolResponse.stdoutBytes) || Number.isFinite(toolResponse.stderrBytes) || typeof toolResponse.stdout === "string" || typeof toolResponse.stderr === "string") {
+		return nativeStreamModelBytes(toolResponse, "stdout") + nativeStreamModelBytes(toolResponse, "stderr");
+	}
+	try {
+		return byteLength(JSON.stringify(toolResponse));
+	} catch {
+		return 0;
+	}
 }
 
 /**
@@ -247,6 +390,16 @@ function average(values) {
  * transcript, where it is the strictly better signal.
  */
 export async function runOccStopRound(
+	dataRoot,
+	sessionId,
+	{ observation, stopHookActive, model, contextWindowTokens, assistantBytes = 0 },
+) {
+	return withOccStateLock(dataRoot, sessionId, () =>
+		runOccStopRoundLocked(dataRoot, sessionId, { observation, stopHookActive, model, contextWindowTokens, assistantBytes }),
+	);
+}
+
+async function runOccStopRoundLocked(
 	dataRoot,
 	sessionId,
 	{ observation, stopHookActive, model, contextWindowTokens, assistantBytes = 0 },
@@ -382,36 +535,42 @@ async function finish(dataRoot, sessionId, state, decision, block) {
 
 /** PostToolUse(TodoWrite): record plan + new boundary candidate. */
 export async function runOccTodoBoundary(dataRoot, sessionId, todos) {
-	const state = await loadOccState(dataRoot, sessionId);
-	const plan = todosToPlan(todos);
-	if (plan === undefined) return { state, transition: null };
-	const transition = analyzePlanTransition(state.plan, plan);
-	state.plan = plan;
-	if (transition.completedSteps.length > 0) {
-		state.pendingBoundary = true;
-		state.completedBoundaryRequestCounts.push(Math.max(1, state.requestCount - state.lastBoundaryRequestCount));
-		if (state.completedBoundaryRequestCounts.length > MAX_BOUNDARY_HISTORY) {
-			state.completedBoundaryRequestCounts.shift();
+	return withOccStateLock(dataRoot, sessionId, async () => {
+		const state = await loadOccState(dataRoot, sessionId);
+		const plan = todosToPlan(todos);
+		if (plan === undefined) return { state, transition: null };
+		const transition = analyzePlanTransition(state.plan, plan);
+		state.plan = plan;
+		if (transition.completedSteps.length > 0) {
+			state.pendingBoundary = true;
+			state.completedBoundaryRequestCounts.push(Math.max(1, state.requestCount - state.lastBoundaryRequestCount));
+			if (state.completedBoundaryRequestCounts.length > MAX_BOUNDARY_HISTORY) {
+				state.completedBoundaryRequestCounts.shift();
+			}
+			state.lastBoundaryRequestCount = state.requestCount;
 		}
-		state.lastBoundaryRequestCount = state.requestCount;
-	}
-	await persistOccState(dataRoot, sessionId, state, "todo-boundary");
-	return { state, transition };
+		await persistOccState(dataRoot, sessionId, state, "todo-boundary");
+		return { state, transition };
+	});
 }
 
 /** UserPromptSubmit "CORRECTION:" → epoch bump, debt cleared (DESIGN §2.4). */
 export async function runOccCorrection(dataRoot, sessionId) {
-	const state = await loadOccState(dataRoot, sessionId);
-	state.epoch += 1;
-	state.carriedDebtTokens = 0;
-	state.cacheDebtRepaymentTokens = 0;
-	await persistOccState(dataRoot, sessionId, state, "correction");
-	return state;
+	return withOccStateLock(dataRoot, sessionId, async () => {
+		const state = await loadOccState(dataRoot, sessionId);
+		state.epoch += 1;
+		state.carriedDebtTokens = 0;
+		state.cacheDebtRepaymentTokens = 0;
+		await persistOccState(dataRoot, sessionId, state, "correction");
+		return state;
+	});
 }
 
 /** Test hook: write a state snapshot without a Stop round. */
 export async function setOccStateForTests(dataRoot, sessionId, patch) {
-	const state = { ...initialOccState(), ...(await loadOccState(dataRoot, sessionId)), ...patch };
-	await persistOccState(dataRoot, sessionId, state, "test-seed");
-	return state;
+	return withOccStateLock(dataRoot, sessionId, async () => {
+		const state = { ...initialOccState(), ...(await loadOccState(dataRoot, sessionId)), ...patch };
+		await persistOccState(dataRoot, sessionId, state, "test-seed");
+		return state;
+	});
 }

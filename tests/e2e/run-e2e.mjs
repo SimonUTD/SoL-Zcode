@@ -18,6 +18,7 @@ const SCENARIO_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_ORDER = [
 	"s3-g9-userprompt", // probe/G9 first: payload intel for the rest
 	"s1-edit-equivalence",
+	"s8-then-run-fusion", // then_run fused verification loop (audit m5)
 	"s4-observation-loop",
 	"s2-reducer-adversarial",
 	"s7-failopen",

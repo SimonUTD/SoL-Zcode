@@ -142,6 +142,31 @@ export async function readChainHead(path) {
 }
 
 /**
+ * Run `fn` under an exclusive O_EXCL lock file named `name` under
+ * $ZCODE_PLUGIN_DATA/run/locks — the same primitive appendChained uses, exposed
+ * for other cross-process read-modify-write sections (occ-state, audit m1).
+ * Same lock names must only ever be acquired in one nesting order to avoid
+ * deadlocks; today the only nesting is <occ-state lock> → <ledger lock>.
+ *
+ * Lock acquisition is fail-open: after LOCK_ATTEMPTS × LOCK_DELAY_MS (~3s, and
+ * stale-breaking after 30s) the callback runs WITHOUT the lock rather than
+ * blocking the hook past its host deadline — matching the pre-lock behavior
+ * (a racy update beats a dropped one; the regression test exercises the
+ * uncontended serialization).
+ */
+export async function withPluginLock(dataRoot, name, fn) {
+	if (typeof name !== "string" || name.length === 0) return fn();
+	await mkdir(lockDir(dataRoot), { recursive: true, mode: 0o700 });
+	const lock = join(lockDir(dataRoot), `${name}.lock`);
+	if (!(await acquireLock(lock))) return fn();
+	try {
+		return await fn();
+	} finally {
+		await releaseLock(lock);
+	}
+}
+
+/**
  * Append one chained entry. Returns the new head hash, or null when the lock
  * could not be acquired (callers treat this as fail-open: skip the ledger line,
  * never fail the mechanism).

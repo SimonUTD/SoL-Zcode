@@ -20,6 +20,7 @@ import { dirname } from "node:path";
 import { resolveConfig } from "./lib/config.mjs";
 import {
 	accumulateOccUsage,
+	occToolResponseBytes,
 	observeTranscript,
 	resolveContextWindowTokens,
 	runOccCorrection,
@@ -288,15 +289,13 @@ async function handleEvent(payload, cfg) {
 				await archiveNativeObservation(root, sessionId, toolName, extracted, cfg);
 			}
 			if (cfg.onlineCompact) {
-				// G21 cumulative estimator: count the tool-result volume the
-				// payload reports (stdout+stderr byte fields preferred, else the
-				// delivered strings / structured response size — what the host
-				// actually hands the model). For the plugin's own MCP tools the
-				// response IS the placeholder the model sees, so no
-				// removedTokens adjustment is needed: the archived full output
-				// never enters the context. Native Bash large outputs are
-				// conservative in the over-count direction (full stdoutBytes vs
-				// the ~2KB preview the model keeps, G7).
+				// G21 cumulative estimator (m2-calibrated in lib/occ.mjs): count the
+				// tool-result volume AS DELIVERED TO THE MODEL — for the plugin's own
+				// MCP tools the response IS the placeholder text the model sees (the
+				// archived full output never enters the context); for native Bash,
+				// untruncated outputs count their full byte fields while truncated
+				// ones count the host's ~2 KB persisted-output preview envelope
+				// (G7), not the full stdoutBytes.
 				const usageBytes = occToolResponseBytes(toolResponse);
 				if (usageBytes > 0) {
 					await accumulateOccUsage(root, sessionId, usageBytes, `tool:${toolName ?? "native"}`);
@@ -368,25 +367,6 @@ function nativeBytes(payload) {
 	}
 	if (typeof tr === "string") return Buffer.byteLength(tr, "utf8");
 	return undefined;
-}
-
-/**
- * G21 cumulative estimator input: the tool-result byte volume as reported by
- * the PostToolUse payload — byte fields first (stdoutBytes+stderrBytes carry
- * the FULL output even when the payload stdout is truncated to 30000 chars,
- * G6), then the delivered stdout string, then the stringified structured
- * response (e.g. non-Bash tools). Same accounting as the trajectory byte
- * fields (nativeBytes), extended for structured non-Bash responses.
- */
-function occToolResponseBytes(toolResponse) {
-	const native = nativeBytes({ tool_response: toolResponse });
-	if (typeof native === "number") return native;
-	if (toolResponse === undefined || toolResponse === null) return 0;
-	try {
-		return Buffer.byteLength(JSON.stringify(toolResponse), "utf8");
-	} catch {
-		return 0;
-	}
 }
 
 async function main() {

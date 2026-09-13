@@ -9,13 +9,17 @@
  * Method (dual evidence):
  *   - a fixture probe plugin (tests/e2e, not sol-zcode) returns
  *     additionalContext containing a unique marker on UserPromptSubmit;
- *   - evidence A: the marker's VALUE appears in the session transcript (the
- *     exact message history the model saw; captured by the probe's Stop hook,
- *     since rollout request bodies carry no `messages` under the default
- *     modelIoFullRetentionEnabled=false — P2 finding);
+ *   - evidence A: the marker's VALUE appears in the rollout REQUEST messages
+ *     (G14: headless rollouts carry request.messages, tool results included —
+ *     retention under modelIoFullRetentionEnabled=false is simply not
+ *     guaranteed long-term, which is why the probe also snapshots the
+ *     Stop-time transcript as a second view of the message history);
  *   - evidence B: the model echoes the exact marker value in its reply (the
  *     prompt only describes the marker's FORMAT, never the value, so a correct
  *     echo is only possible if the value actually reached the context).
+ * The established verdict (G9, corrected) is REACHES-MODEL — the scenario now
+ * FAILS if a future host regresses reachability (m6), and a never-injected
+ * control marker must not be findable (anti-vacuous negative control).
  * Also records the real Stop/UserPromptSubmit payload field inventory for the
  * other scenarios (contextWindow presence etc.).
  */
@@ -68,13 +72,14 @@ export async function run({ deadline } = {}) {
 		const ups = events.filter((entry) => entry.event === "UserPromptSubmit");
 		assertions.check("UserPromptSubmit hook fired in headless", ups.length >= 1, `events=${ups.length}`);
 
-		// Evidence A: marker value in the model REQUEST (rollout request body).
-		// NOTE (P2 finding): under modelIoFullRetentionEnabled=false the rollout
-		// records request.system + request.tools but not request.messages, and the
-		// Stop-time transcript_path carries ONLY the last assistant message — so
-		// the transcript can only ever prove the marker via the model's own echo.
-		// The rollout location of the marker is therefore the independent
-		// request-side evidence and is located field-by-field below.
+		// Evidence A: marker value in the model REQUEST (rollout request messages).
+		// G14 (authoritative): headless rollouts DO carry request.messages (the
+		// initial P2 draft claiming the opposite was wrong — this run's own
+		// rolloutLocations locate the marker at $.request.messages[5].content).
+		// Retention under modelIoFullRetentionEnabled=false is not guaranteed
+		// long-term, and the Stop-time transcript_path carries only the last
+		// assistant message (G21), so the probe's transcript copies remain a
+		// belt-and-braces second view, not the primary request-side evidence.
 		const copies = await readTranscriptCopies(sc);
 		const lastTranscript = copies.at(-1)?.text ?? "";
 		const transcriptEchoOnly = lastTranscript.includes(marker);
@@ -122,7 +127,30 @@ export async function run({ deadline } = {}) {
 		else verdict = "DOES-NOT-REACH-MODEL (no request-side trace + NOT-FOUND)";
 		notes.verdict = verdict;
 		notes.transcriptEchoOnly = transcriptEchoOnly;
-		assertions.check("G9 verdict determined (request-side + echo evidence recorded)", typeof verdict === "string", verdict);
+		// m6: the corrected G9 conclusion is a PASS CONDITION, not a note. The
+		// previous `typeof verdict === "string"` check was vacuous — every
+		// branch produces a string, so a host regression to DOES-NOT-REACH-MODEL
+		// would still have passed.
+		assertions.check(
+			"G9 verdict is REACHES-MODEL (request-side evidence + exact echo — regression would fail here)",
+			typeof verdict === "string" && verdict.startsWith("REACHES-MODEL"),
+			`verdict=${verdict} rolloutRequestSide=${rolloutRequestSide} echoed=${echoed}`,
+		);
+		assertions.check(
+			"model echoed the exact marker value (the strongest single reachability signal)",
+			echoed === true,
+			`answerHead=${(answer.split("\n")[0] ?? "").slice(0, 80)}`,
+		);
+		// Anti-vacuous negative control (m6): a marker that was NEVER injected
+		// must not be findable in the rollout request messages — proves the
+		// finder (and thus the positive hit above) is not trivially matching.
+		const controlMarker = `G9MARK-${randomBytes(4).toString("hex")}`;
+		const controlHit = rText !== null && rText.includes(controlMarker);
+		assertions.check(
+			"negative control: a never-injected marker is absent from the rollout",
+			controlHit === false,
+			`control=${controlMarker}`,
+		);
 
 		// Payload field inventory for the other scenarios (S5 especially).
 		const stopEvents = events.filter((entry) => entry.event === "Stop");

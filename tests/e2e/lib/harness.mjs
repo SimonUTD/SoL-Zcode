@@ -276,10 +276,17 @@ export async function rolloutText(path) {
 
 /**
  * Walk the parsed rollout JSONL and return the first string value containing
- * `substring` (request messages / system / responses), or null when absent.
- * (Raw-text search would miss JSON-escaped newlines.)
+ * `substring`, or null when absent. (Raw-text search would miss JSON-escaped
+ * newlines.)
+ *
+ * requestOnly (audit m4): restrict the search to the request-side messages of
+ * each rollout record — `request.messages` (zcode 0.16.5, G14) with
+ * `request.body.messages` accepted for hosts that nest the body. Without this
+ * a model echoing the target text in its RESPONSE would satisfy the assertion
+ * (s3 proved `$.response.*` hits are a real rollout shape), which is exactly
+ * the false-green the "reached the model" claims must exclude.
  */
-export async function rolloutFindString(path, substring) {
+export async function rolloutFindString(path, substring, { requestOnly = false } = {}) {
 	const text = await rolloutText(path);
 	if (text === null) return null;
 	const walk = (value) => {
@@ -299,11 +306,15 @@ export async function rolloutFindString(path, substring) {
 		}
 		return null;
 	};
+	const scopesFor = (parsed) =>
+		requestOnly ? [parsed?.request?.messages, parsed?.request?.body?.messages] : [parsed];
 	for (const line of text.split("\n")) {
 		if (line.trim().length === 0) continue;
 		try {
-			const hit = walk(JSON.parse(line));
-			if (hit !== null) return hit;
+			for (const scope of scopesFor(JSON.parse(line))) {
+				const hit = walk(scope);
+				if (hit !== null) return hit;
+			}
 		} catch {
 			/* skip unparsable */
 		}
@@ -360,6 +371,25 @@ export async function readTranscriptCopies(sc) {
 }
 
 // ---------------------------------------------------------------- utilities
+
+/**
+ * Run the evidence-integrity CLI (plugin/scripts/verify-evidence.mjs) against a
+ * scenario data root — closes the C3↔e2e loop (audit m3): the reconciliation
+ * CLI must confirm exit 0 / "all chains verified" on REAL session artifacts
+ * before the scenario home is cleaned up.
+ */
+export function verifyEvidence(dataRootDir) {
+	const result = spawnSync(process.execPath, [join(REPO, "plugin", "scripts", "verify-evidence.mjs"), dataRootDir], {
+		encoding: "utf8",
+		timeout: 120_000,
+	});
+	return {
+		code: result.status,
+		signal: result.signal,
+		stdout: typeof result.stdout === "string" ? result.stdout : "",
+		stderr: typeof result.stderr === "string" ? result.stderr : "",
+	};
+}
 
 export async function listFilesRecursive(root) {
 	const out = [];

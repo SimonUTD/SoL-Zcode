@@ -35,6 +35,7 @@ import {
 	recordResult,
 	runPrompt,
 	sha256Text,
+	verifyEvidence,
 } from "../lib/harness.mjs";
 
 export const id = "s2-reducer-adversarial";
@@ -147,9 +148,11 @@ export async function run({ deadline } = {}) {
 				// Receipt evidence: rollout request messages carry the sol_bash tool
 				// result verbatim (the Stop-time transcript holds only the last
 				// assistant message — S3/S4 P2 finding, so the rollout is the source).
+				// requestOnly pins the REQUEST side (m4): a model echoing the receipt
+				// in its response must never satisfy a "reached the model" claim.
 				const { findRollout, rolloutFindString } = await import("../lib/harness.mjs");
 				const rollout = await findRollout(sc, run1.sessionId);
-				const receiptText = rollout === null ? null : await rolloutFindString(rollout, "sol_zcode_evidence_receipt_v1");
+				const receiptText = rollout === null ? null : await rolloutFindString(rollout, "sol_zcode_evidence_receipt_v1", { requestOnly: true });
 				notes.receiptReachedModel = receiptText !== null;
 				assertions.check("receipt text reached the model (rollout request message)", receiptText !== null, `rollout=${rollout ?? "missing"}`);
 				if (receiptText !== null) {
@@ -203,6 +206,22 @@ export async function run({ deadline } = {}) {
 			"aux zero-trace: ledger dir holds exactly the main session dir",
 			ledgerSessions.length === 1 && ledgerSessions[0] === run1.sessionId,
 			`sessions=${ledgerSessions.join(",")}`,
+		);
+
+		// C3↔e2e closure (audit m3): run the evidence-integrity CLI over the REAL
+		// session data root before cleanup — chains, the adversarial reducer
+		// object (name == sha256(content)), object/ledger reconciliation and the
+		// session-summary anchors must all verify.
+		const verify = verifyEvidence(sc.dataRoot);
+		notes.verifyEvidence = {
+			code: verify.code,
+			signal: verify.signal,
+			tail: verify.stdout.trim().split("\n").at(-1) ?? "",
+		};
+		assertions.check(
+			"verify-evidence over the scenario data root: exit 0, all chains verified",
+			verify.code === 0 && verify.stdout.includes("OK: all chains verified"),
+			`code=${verify.code} ${notes.verifyEvidence.tail} ${verify.stderr.slice(0, 200)}`,
 		);
 
 		await recordResult(id, {

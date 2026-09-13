@@ -66,7 +66,9 @@ export async function run({ deadline } = {}) {
 		assertions.check("re-run Stop carried stop_hook_active=true (G17 continuation loop)", activeStops.length >= 1, `active=${activeStops.length}`);
 
 		const rollout = await findRollout(sc, run1.sessionId);
-		const reasonInRequest = rollout !== null && (await rolloutFindString(rollout, "[e2e-probe] stop-block channel test")) !== null;
+		// requestOnly (m4): the reason must be IN A MODEL REQUEST (the channel
+		// claim); a response-side echo must not satisfy it.
+		const reasonInRequest = rollout !== null && (await rolloutFindString(rollout, "[e2e-probe] stop-block channel test", { requestOnly: true })) !== null;
 		notes.blockReasonInRequest = reasonInRequest;
 		assertions.check("block reason text appears in a subsequent model request body", reasonInRequest === true, `rollout=${rollout ?? "missing"}`);
 

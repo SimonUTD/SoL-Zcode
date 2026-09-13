@@ -5,9 +5,12 @@
  *  1. Passive host-behavior telemetry: logs every hooked-event payload
  *     (SessionStart/UserPromptSubmit/Stop) to events.jsonl inside its install
  *     dir, and copies the transcript_path file (host temp file, G5) on every
- *     Stop so the e2e layer can inspect the exact message history the model
- *     saw (rollout request bodies carry no `messages` under the default
- *     modelIoFullRetentionEnabled=false — P2 finding).
+ *     Stop so the e2e layer can inspect a snapshot of the message history the
+ *     model saw. Rollouts DO carry request.messages (G14 — the early P2 draft
+ *     claiming otherwise was wrong); their retention under
+ *     modelIoFullRetentionEnabled=false is simply not guaranteed long-term,
+ *     which is why the transcript copies are kept as a second, point-in-time
+ *     view.
  *  2. G9 recheck: when `marker` is a string, the UserPromptSubmit hook returns
  *     additionalContext containing that marker — the P2 recheck of the
  *     unresolved GOTCHAS G9 counter-example.

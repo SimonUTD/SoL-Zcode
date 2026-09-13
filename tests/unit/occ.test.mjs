@@ -13,10 +13,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
 	CHARS_PER_TOKEN,
+	PERSISTED_PREVIEW_CHARS,
 	SYSTEM_BASELINE_TOKENS,
 	accumulateOccUsage,
 	initialOccState,
 	loadOccState,
+	occToolResponseBytes,
 	observeTranscript,
 	resolveContextWindowTokens,
 	runOccCorrection,
@@ -401,4 +403,147 @@ test("resolveContextWindowTokens: payload field wins, env knob overrides the def
 		const state = await loadOccState(root, SESSION);
 		assert.equal(state.contextWindowTokens, 50_000);
 	});
+});
+
+// ------------------------------------------- m1: occ-state cross-process locking
+
+test("concurrent accumulateOccUsage from three processes loses no update (m1 lock regression)", async () => {
+	await withRoot(async (root) => {
+		const script = join(root, "worker.mjs");
+		await writeFile(
+			script,
+			`import { accumulateOccUsage } from ${JSON.stringify(new URL("../../plugin/hooks/lib/occ.mjs", import.meta.url).href)};\n` +
+				`const root = process.argv[2];\n` +
+				`for (let i = 0; i < 10; i += 1) await accumulateOccUsage(root, "sess_occ-conc-1", 1000, "tool:Bash");\n`,
+			"utf8",
+		);
+		const { spawn } = await import("node:child_process");
+		const workers = [1, 2, 3].map(
+			(n) =>
+				new Promise((resolve, reject) => {
+					const child = spawn(process.execPath, [script, root], { stdio: "ignore" });
+					child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`worker ${n} exit ${code}`))));
+				}),
+		);
+		await Promise.all(workers);
+
+		// Without the per-session state lock, parallel PostToolUse hook
+		// processes (the host runs same-step tool calls concurrently) each
+		// load→add→persist and the last rename wins: lost accumulates and
+		// non-monotonic history states.
+		const state = await loadOccState(root, "sess_occ-conc-1");
+		assert.equal(state.cumulativeBytes, 30_000, "every concurrent accumulate must be reflected exactly once");
+		assert.equal(state.estimatedTokens, Math.ceil(30_000 / CHARS_PER_TOKEN));
+
+		const history = await verifyChainFile(occHistoryPath(root, "sess_occ-conc-1"));
+		assert.equal(history.ok, true, "chained history stays intact under concurrency");
+		assert.equal(history.lines, 30, "one state line per accumulate");
+
+		const { readFile } = await import("node:fs/promises");
+		const raw = await readFile(occHistoryPath(root, "sess_occ-conc-1"), "utf8");
+		const cumulatives = raw
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line).state.cumulativeBytes);
+		assert.deepEqual(cumulatives, Array.from({ length: 30 }, (_v, i) => (i + 1) * 1000), "cumulativeBytes is strictly monotonic in +1000 steps");
+	});
+});
+
+test("concurrent accumulateOccUsage interleaved with a Stop round keeps block counters monotonic (m1)", async () => {
+	await withRoot(async (root) => {
+		const session = "sess_occ-conc-2";
+		const script = join(root, "worker.mjs");
+		await writeFile(
+			script,
+			`import { accumulateOccUsage } from ${JSON.stringify(new URL("../../plugin/hooks/lib/occ.mjs", import.meta.url).href)};\n` +
+				`const root = process.argv[2];\n` +
+				`for (let i = 0; i < 8; i += 1) await accumulateOccUsage(root, ${JSON.stringify(session)}, 500, "tool:Bash");\n`,
+			"utf8",
+		);
+		const { spawn } = await import("node:child_process");
+		const worker = new Promise((resolve, reject) => {
+			const child = spawn(process.execPath, [script, root], { stdio: "ignore" });
+			child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`worker exit ${code}`))));
+		});
+		// The parent simultaneously runs Stop rounds (the narrow m1 window: a
+		// late unlocked accumulate used to be able to overwrite Stop-round
+		// persistence and roll consecutiveBlocks/totalBlocks back).
+		await setOccStateForTests(root, session, { consecutiveBlocks: 1, totalBlocks: 1 });
+		const stopRound = (async () => {
+			for (let i = 0; i < 8; i += 1) {
+				await runOccStopRound(root, session, { observation: null, stopHookActive: true, assistantBytes: 0 });
+			}
+		})();
+		await Promise.all([worker, stopRound]);
+
+		const state = await loadOccState(root, session);
+		assert.equal(state.cumulativeBytes, 4000, "no lost accumulate");
+		assert.ok(state.consecutiveBlocks >= 1 && state.totalBlocks >= 1, "block counters were never rolled back");
+		assert.ok((await verifyChainFile(occHistoryPath(root, session))).ok, "history chain intact");
+	});
+});
+
+// ------------------------------------------- m2: estimator calibration (both branches)
+
+test("occToolResponseBytes: truncated native output counts the model-visible preview envelope, not stdoutBytes (m2)", () => {
+	const stdout = Array.from({ length: 4000 }, (_v, i) => `line-${String(i).padStart(5, "0")} padded x\n`).join("");
+	const path = "/home/u/.zcode/cli/exec/sess_abc/call_42-stdout.log";
+	const response = {
+		stdout: stdout.slice(0, 30_000), // host truncates the payload stdout (G6)
+		stderr: "",
+		exitCode: 0,
+		stdoutTruncated: true,
+		stdoutBytes: 148_000,
+		persistedOutputPath: path,
+		persistedOutputSize: 148_000,
+	};
+	const counted = occToolResponseBytes(response);
+	// The expected envelope is spelled out independently from the host format
+	// (REr/xne, zcode 0.16.5): preview is the first 2000 chars of the output.
+	const expected = Buffer.byteLength(
+		[
+			"<persisted-output>",
+			`Output too large (${Math.round(148_000 / 1000)} KB). Full output saved to: ${path}`,
+			"",
+			"Preview (first 2 KB):",
+			stdout.slice(0, PERSISTED_PREVIEW_CHARS),
+			"...",
+			"</persisted-output>",
+		].join("\n"),
+		"utf8",
+	);
+	assert.equal(counted, expected);
+	assert.ok(counted < 4096, `a 148 KB truncated output must count as the ~2 KB preview envelope, got ${counted}`);
+	assert.ok(counted < 148_000 / 10, "nowhere near the old full stdoutBytes accounting");
+
+	// The envelope size follows the persisted path length (it is part of the
+	// model-visible notice) — and nothing else in the payload moves it.
+	const longer = occToolResponseBytes({ ...response, persistedOutputPath: `${path}-with-a-much-longer-name.log` });
+	assert.equal(longer - counted, "-with-a-much-longer-name.log".length);
+
+	// No persisted path at all: the notice still forms, with an empty path.
+	const noPath = occToolResponseBytes({ ...response, persistedOutputPath: undefined });
+	assert.ok(noPath > PERSISTED_PREVIEW_CHARS && noPath < counted + 1);
+});
+
+test("occToolResponseBytes: untruncated native output and MCP text count what the model actually sees (m2)", () => {
+	// Untruncated: the full byte fields count (the stream was delivered intact).
+	assert.equal(
+		occToolResponseBytes({ stdout: "x".repeat(28_893), stderr: "e", stdoutBytes: 28_893, stderrBytes: 1, stdoutTruncated: false }),
+		28_894,
+	);
+	// No byte fields: delivered stdout string length.
+	assert.equal(occToolResponseBytes({ stdout: "abc", stderr: "" }), 3);
+	// stderr truncated on its own: stdout full + stderr envelope.
+	const mixed = occToolResponseBytes({ stdout: "ok\n", stdoutBytes: 3, stderr: "e".repeat(30_100).slice(0, 30_000), stderrBytes: 30_100, stderrTruncated: true, stderrPersistedOutputPath: "/p/err.log" });
+	assert.ok(mixed > 3 && mixed < 3 + PERSISTED_PREVIEW_CHARS + 512, `stderr envelope dominates, got ${mixed}`);
+
+	// MCP tool response (sol_* placeholder): the text parts are the model-visible bytes.
+	const placeholder = "[obs obs_abc] large tool result replaced …".repeat(3);
+	assert.equal(occToolResponseBytes({ content: [{ type: "text", text: placeholder }] }), Buffer.byteLength(placeholder, "utf8"));
+	assert.equal(occToolResponseBytes(placeholder), Buffer.byteLength(placeholder, "utf8"));
+
+	// Structured non-Bash fallback: stringified size (unchanged behavior).
+	assert.equal(occToolResponseBytes({ a: 1 }), 3 + 4); // '{"a":1}'
+	assert.equal(occToolResponseBytes(undefined), 0);
 });

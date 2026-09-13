@@ -1,27 +1,36 @@
 /*
- * S5 — Online Context Compact, real long session (real model). v5.
+ * S5 — Online Context Compact, real long session (real model). v6.
  *
- * v5 redesign after the P2.5 OCC fix (GOTCHAS G21/G22): pressure detection is
- * a CUMULATIVE estimator fed by everything the hooks can see
- * (UserPromptSubmit prompt bytes, PostToolUse tool_response byte fields —
- * stdoutBytes carries the FULL output even though the payload stdout is
- * truncated, G6 — and Stop last_assistant_message bytes). The v4 approach
- * (estimate from the Stop transcript) is structurally blind: 0.16.5 headless
- * Stop transcripts carry ONLY the last assistant message (94-114 B observed),
- * so tool-call volume can never grow the estimate.
+ * v6 redesign after the m2 estimator calibration: the cumulative estimator
+ * now counts tool-result bytes AS DELIVERED TO THE MODEL — a truncated native
+ * Bash output contributes only the host's ~2 KB persisted-output preview
+ * envelope (G7), not its full stdoutBytes. v5 built its pressure from two
+ * `seq 1 20000` outputs (108894 B each) whose bulk the model never saw, so
+ * under the calibrated accounting that construction cannot reach the economic
+ * zone. v6 builds pressure from UNTRUNCATED outputs instead: `seq 1 6000`
+ * emits 28893 B (< the host's 30000-char/byte inline cutover, G6), so the
+ * model sees — and the estimator counts — every byte. Real pressure and
+ * estimated pressure now coincide by construction.
+ *
+ * Estimator (G21 fix): T = ceil(cumulativeBytes/4) + 12_000 system baseline;
+ * cumulativeBytes sums UserPromptSubmit prompt bytes + PostToolUse
+ * tool_response bytes (model-visible calibration) + Stop
+ * last_assistant_message bytes. Increments are per-Stop deltas of T.
  *
  * Real-window trigger math (notes.math below, no threshold lowering — the
  * plugin default 1M window is used as-is):
- *   R1: TodoWrite boundary (Step 01 completed, 29 pending) + one native
- *       `seq 1 20000` (~108.9 KB stdout, the G6-measured size) -> Stop #1:
- *       single increment -> no block (asserted; negative-discriminant math).
- *   R2 (--resume, same sessionId): second `seq 1 20000` -> Stop #2: two
- *       increments collapse the average, the window request bound opens and
- *       breakeven (~16.8 requests at T2 ~= 66.7k tokens) fits the horizon
- *       (~27) -> {"decision":"block"} fires (the only model-reachable Stop
- *       channel, G17). Continuations follow the standing rule (TodoWrite next
- *       step + short reply); the second Stop is still economical -> a second
- *       block; the consecutive self-limit (2) then ends the loop.
+ *   R1: TodoWrite boundary (Step 01 completed, 29 pending) + ONE untruncated
+ *       `seq 1 6000` (28893 B) -> Stop #1: T1 ~= 19.4k tokens < 21000
+ *       (memo+keepRecent floor) -> savingTokens <= 0 -> compact is
+ *       STRUCTURALLY unreachable (stronger than v5's marginal-discriminant
+ *       argument); asserted as the no-premature-block check.
+ *   R2 (--resume, same sessionId): THREE more untruncated `seq 1 6000` calls
+ *       -> Stop #2: T2 ~= 41k, increments [T1, T2-T1] collapse the average,
+ *       breakeven (~23 requests) fits the horizon (~46) -> {"decision":"block"}
+ *       fires (the only model-reachable Stop channel, G17). Continuations
+ *       follow the standing rule (TodoWrite next step + short reply); the
+ *       next Stop is still economical -> a second block; the consecutive
+ *       self-limit (2) then ends the loop.
  *
  * Compaction detection (5b): honestly recorded as "unavailable" under the G21
  * data source — the entries-drop detector cannot see native compaction
@@ -30,8 +39,8 @@
  * hosts that provide full-conversation transcripts.
  *
  * Options: onlineCompact + trajectory only (observationPack/evidenceReducer
- * stay OFF on purpose: sol_bash would placeholder-replace the large outputs
- * and the pressure construction needs the native Bash byte fields).
+ * stay OFF on purpose: sol_bash would placeholder-replace outputs >10 KiB and
+ * change the model-visible volume the estimator must track).
  */
 import {
 	cleanupScenario,
@@ -49,12 +58,14 @@ import {
 } from "../lib/harness.mjs";
 
 export const id = "s5-occ-stopblock";
-export const title = "OCC cumulative-estimator economic Stop-block trigger (real 1M window) + honest G21 detector downgrade";
+export const title = "OCC cumulative-estimator economic Stop-block trigger (real 1M window, model-visible-byte calibrated) + honest G21 detector downgrade";
+
+const SEQ_BYTES = 28_893; // `seq 1 6000`: 9*2 + 90*3 + 900*4 + 5001*5 bytes (ASCII)
 
 const NOTES_MATH = [
-	"Estimator (G21 fix): T = ceil(cumulativeBytes/4) + 12_000 system baseline; cumulativeBytes sums UserPromptSubmit prompt bytes + PostToolUse tool_response bytes (stdoutBytes/stderrBytes fields preferred — full output size, G6) + Stop last_assistant_message bytes. Increments are per-Stop deltas of T (sliding window 20).",
-	"Stop #1 (single increment, window 1e6): need 11.5*T/(T-21000) <= min(2*min(1+29, floor((1e6-T)/T)), floor((1e6-T)/T)) — with one increment the average IS T, so effectiveHorizon <= floor((1e6-T)/T) < 11.5 for all T < 87k, and 11.5*T/(T-21000) >= 11.5 always — mathematically unreachable; asserted as the no-premature-block check.",
-	"Stop #2 (increments [T1, T2-T1], T2 ~= 66_700 after two seq 1 20000 runs ~= 108_894 B each + prompts): avg = T2/2 ~= 33_350, windowRequestUpperBound = floor((1e6-T2)/avg) ~= 27, expectedRemaining = min(30, 27) = 27, effectiveHorizon (first compaction, scale 2, capped by wu) = 27, breakeven = 11.5*66_700/(66_700-21_000) ~= 16.8 <= 27 -> economic block. Real thresholds, real window.",
+	"Estimator (G21 fix, m2-calibrated): T = ceil(cumulativeBytes/4) + 12_000 system baseline; cumulativeBytes sums UserPromptSubmit prompt bytes + PostToolUse tool_response bytes counted AS DELIVERED TO THE MODEL (untruncated streams: full byte fields; truncated streams: the host's ~2 KB persisted-output preview envelope, G7) + Stop last_assistant_message bytes. Increments are per-Stop deltas of T (sliding window 20).",
+	`Stop #1 (single untruncated seq output, ${SEQ_BYTES} B): cumulative ~= 29.7k B -> T1 ~= 19.4k tokens < 21_000 (keepRecent 20k + memo 1k) -> savingTokens <= 0 -> compressible=false, compact STRUCTURALLY unreachable regardless of horizon; asserted as the no-premature-block check.`,
+	`Stop #2 (three more untruncated seq outputs): cumulative ~= 117k B -> T2 ~= 41k tokens; increments [T1, T2-T1] -> avg ~= T2/2 ~= 20.6k; windowRequestUpperBound = floor((1e6-41k)/20.6k) ~= 46, expectedRemaining = min(30, 46) = 30, effectiveHorizon = min(2*30, 46) = 46, breakeven = 11.5*41k/(41k-21k) ~= 23.4 <= 46 -> economic block. Real thresholds, real window, and every counted byte was actually in the model context.`,
 	"Compaction detection (5b): G21 makes the entries-drop detector structurally blind (Stop transcript entries pinned at 1; the cumulative total cannot decrease when unobservable history is compacted) -> occ-state records compactionDetection=unavailable; priorCompactionCount stays 0; nothing is simulated.",
 ];
 
@@ -66,7 +77,7 @@ const STAGE1_PROMPT = [
 	"",
 	'1. Call TodoWrite with EXACTLY 30 items. Content strings are exactly "Step 01", "Step 02", ..., "Step 30". Step 01 has status "completed"; every other item has status "pending".',
 	"",
-	"2. Run the Bash tool with the command exactly: seq 1 20000",
+	"2. Run the Bash tool with the command exactly: seq 1 6000",
 	"",
 	"3. Then reply with exactly: STAGE1-DONE",
 	"",
@@ -76,7 +87,7 @@ const STAGE1_PROMPT = [
 const STAGE2_PROMPT = [
 	"Continue the context-pressure experiment. Perform EXACTLY these actions, in order:",
 	"",
-	"1. Run the Bash tool with the command exactly: seq 1 20000",
+	"1. Run the Bash tool THREE TIMES, as THREE SEPARATE Bash tool calls (do not combine them into one command), each with the command exactly: seq 1 6000",
 	"",
 	"2. Then reply with exactly: DONE2",
 	"",
@@ -94,7 +105,7 @@ export async function run({ deadline } = {}) {
 	const notes = { math: NOTES_MATH, rounds: [] };
 	const sc = await makeScenario(id, { options: { onlineCompact: true, trajectory: true } });
 	try {
-		// R1 — boundary + first big tool output (cheap first increment).
+		// R1 — boundary + first untruncated big tool output.
 		const stage1 = await runPrompt(sc, STAGE1_PROMPT, { label: "occ-stage1", timeoutMs: 300_000 });
 		sessionIds.push(stage1.sessionId);
 		if (stage1.usage) usages.push(stage1.usage);
@@ -114,22 +125,30 @@ export async function run({ deadline } = {}) {
 			totalBlocks: state?.totalBlocks ?? null,
 			compactionDetection: state?.compactionDetection ?? null,
 		});
-		assertions.check("occ state exists after stage1 (onlineCompact active)", state !== null, "occ-state.json missing");
+		assertions.check(
+			"occ state exists after stage1 (onlineCompact active)",
+			state !== null,
+			state === null ? "occ-state.json missing" : `cumulativeBytes=${state.cumulativeBytes} T1=${state.lastContextTokens}`,
+		);
 		assertions.check(
 			"stage1 recorded the TodoWrite boundary (pendingBoundary=true)",
 			state?.pendingBoundary === true,
 			`pendingBoundary=${state?.pendingBoundary}`,
 		);
 		assertions.check(
-			"cumulative estimator saw the tool volume (>=100KB accumulated, G21 regression)",
-			(state?.cumulativeBytes ?? 0) >= 100_000,
+			`calibrated estimator saw the untruncated tool volume in full (>=${SEQ_BYTES}B accumulated — model-visible accounting, m2)`,
+			(state?.cumulativeBytes ?? 0) >= SEQ_BYTES,
 			`cumulativeBytes=${state?.cumulativeBytes}`,
 		);
 		const history1 = await readJsonl(ledgerPath(sc, session, "occ-history.jsonl"));
 		const noPrematureBlock = occHistoryBlocks(history1).length === 0;
-		assertions.check("no block at Stop#1 (single-increment economics cannot fire — see notes.math)", noPrematureBlock, `blocks=${occHistoryBlocks(history1).length}`);
+		assertions.check(
+			"no block at Stop#1 (T1 below the 21k compressibility floor — structurally unreachable, see notes.math)",
+			noPrematureBlock,
+			`blocks=${occHistoryBlocks(history1).length} T1=${T1}`,
+		);
 
-		// R2 — second big tool output (the pressure round).
+		// R2 — three more untruncated outputs (the pressure round).
 		const resume1 = await runPrompt(sc, STAGE2_PROMPT, { resume: session, label: "occ-resume-pressure", timeoutMs: 420_000 });
 		notes.resumeStderrTail = resume1.stderr.slice(-400);
 		sessionIds.push(resume1.sessionId);
@@ -160,8 +179,8 @@ export async function run({ deadline } = {}) {
 			`increments=${JSON.stringify(state?.increments ?? [])}`,
 		);
 		assertions.check(
-			"cumulative estimate reached the economic zone (T2 >= 55k tokens)",
-			typeof T2 === "number" && T2 >= 55_000,
+			"cumulative estimate reached the economic zone from model-visible bytes alone (T2 >= 30k tokens; m2-calibrated)",
+			typeof T2 === "number" && T2 >= 30_000,
 			`T2=${T2}`,
 		);
 
@@ -215,14 +234,15 @@ export async function run({ deadline } = {}) {
 				`todoWrites=${todoWrites}`,
 			);
 			assertions.check(
-				"pressure came from real native Bash outputs (>=2 Bash calls)",
-				bashCalls >= 2,
+				"pressure came from real untruncated native Bash outputs (>=3 Bash calls)",
+				bashCalls >= 3,
 				`bashCalls=${bashCalls}`,
 			);
 			const rollout = await findRollout(sc, session);
-			notes.blockReasonInRequest = rollout !== null && (await rolloutFindString(rollout, "[sol-occ] boundary reached")) !== null;
+			// requestOnly (m4): the reason must be in a model REQUEST message.
+			notes.blockReasonInRequest = rollout !== null && (await rolloutFindString(rollout, "[sol-occ] boundary reached", { requestOnly: true })) !== null;
 			assertions.check(
-				"block reason '[sol-occ] boundary reached' appears in a subsequent model request body (G17 channel)",
+				"block reason '[sol-occ] boundary reached' appears in a subsequent model request message (G17 channel)",
 				notes.blockReasonInRequest === true,
 				`rollout=${rollout ?? "missing"}`,
 			);

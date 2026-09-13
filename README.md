@@ -2,7 +2,7 @@
 
 > Porting NVIDIA [SoL-Pi](https://github.com/NVlabs/SoL-Pi)'s **five surviving token-efficiency mechanisms** into an independent [ZCode](https://zcode.z.ai/) plugin — public plugin APIs only, explicit opt-in, evidence-preserving.
 
-**English TL;DR** — This repo contains `sol-zcode`, a ZCode plugin that ports the five mechanisms SoL-Pi's automated research retained (action fusion, observation packs, evidence-preserving reducer, online context compaction, trajectory inspector). It uses only public plugin APIs (MCP tools + hooks), is disabled by default until explicitly opted in, keeps every original observation on disk in a tamper-evident hash-chained ledger, and leaves auth / provider URLs / model selection / shell semantics to ZCode. Design was audited to 9.5/10; implementation passed 138 unit/integration tests plus 9 real-model e2e scenarios (including prompt-injection adversarial tests). Terminal-Bench 4 A/B benchmark (GLM-5.3-Flash, plugin off vs on) is in progress — results land in `docs/REPORT.md` when ready. See `docs/DESIGN.md` for the full design and honest deviations list.
+**English TL;DR** — This repo contains `sol-zcode`, a ZCode plugin that ports the five mechanisms SoL-Pi's automated research retained (action fusion, observation packs, evidence-preserving reducer, online context compaction, trajectory inspector). It uses only public plugin APIs (MCP tools + hooks), is disabled by default until explicitly opted in, keeps every original observation on disk in a tamper-evident hash-chained ledger, and leaves auth / provider URLs / model selection / shell semantics to ZCode. Design was audited to 9.5/10; implementation passed 138 unit/integration tests plus 9 real-model e2e scenarios (including prompt-injection adversarial tests). A Terminal-Bench 4 three-arm probe (control / treatment / gate, GLM-5.3-Flash, single task, N=1) is complete: treatment −32.1% and gate −60.2% input tokens vs control, savings driven by request-count collapse (77→50→30); the full 63×2 run has not been executed — the pipeline (freeze / ledger / resume / rate-limit watchdog) is verified end-to-end and ready to scale. Formal five-metric report: `docs/REPORT.md`. See `docs/DESIGN.md` for the full design and honest deviations list.
 
 ## 五种机制
 
@@ -37,7 +37,7 @@ node scripts/install-plugin.mjs plugin sol-zcode-dev --options '{"actionFusion":
 | 键 | 类型/默认 | 说明 |
 |---|---|---|
 | `actionFusion` / `observationPack` / `evidenceReducer` / `onlineCompact` / `trajectory` | bool / `false` | 五机制独立开关 |
-| `actionFusionGate` | bool / `false` | 对原生 Write/Edit 等变异工具 exit-2 硬引导改用 sol_* 工具（默认软引导） |
+| `actionFusionGate` | bool / `false` | 对原生 Write/Edit 等变异工具 exit-2 硬引导改用 sol_* 工具（默认软引导）。探针实测（N=1）：1 次拦截后 72 s 内切换、此后变更通道 100% 走 sol_*、零反复，代价 ≈1.2 min |
 | `reducerModel` | string / `""` | 归约模型；空 = 继承宿主当前模型（Zcode 决定） |
 
 类型非法的键按 false 处理并记一条 `config_rejected` 轨迹（可诊断 opt-in 拼写错误）。
@@ -62,17 +62,31 @@ e2e 亮点：双臂编辑等价（字节级）、观察包分页取回逐字节�
 plugin/            sol-zcode 插件（.zcode-plugin/manifest、mcp/、hooks/、core/ 零依赖 vendor、scripts/verify-evidence）
 tests/             unit + integration（138）+ e2e（真模型 9 场景）
 scripts/           install-plugin.mjs / run-tests.mjs
-benchmark/         Terminal-Bench 4 双臂基准（Harbor 自定义 agent；进行中）
-docs/              DESIGN / PLAN / GOTCHAS(G1-G23 宿主行为坑律) / RESEARCH / WORKLOG 审核报告
+benchmark/         Terminal-Bench 4 三臂基准（Harbor 自定义 agent；探针完成，全量待跑）
+docs/              DESIGN / PLAN / GOTCHAS(G1-G23 宿主行为坑律) / RESEARCH / REPORT(正式五指标报告) / WORKLOG 审核报告
 ```
 
 ## 质量流程
 
-每个阶段：开发（subagent）→ 独立审核（subagent，带 file:line 证据与 10 分制评分）→ 整改 → 复审，**≥9.5/10 才放行**。审核报告全部落盘 `docs/WORKLOG/AUDIT_*/`：方案 6.5→9.5、P1 9.0→9.5、P2 9.0→9.5。
+每个阶段：开发（subagent）→ 独立审核（subagent，带 file:line 证据与 10 分制评分）→ 整改 → 复审，**≥9.5/10 才放行**。审核报告全部落盘 `docs/WORKLOG/AUDIT_*/`：方案 6.5→9.5、P1 9.0→9.5、P2 9.0→9.5、P3 8.5→9.5（三臂数据经逐数字独立复算）。
 
-## 基准（进行中）
+## 基准结果（TB4 三臂探针，正式报告见 docs/REPORT.md）
 
-Terminal-Bench 4（63 CPU-only 题）× 双臂（control=插件全关 / treatment=五机制全开，唯一差异=plugins.options），GLM-5.3-Flash，Coding Plan 配额消耗，五指标：input tokens、成本（API 牌价折算口径）、墙钟、异常、解题率。探针先行、freeze manifest + append-only ledger + 断点续跑。结果出来后写入 `docs/REPORT.md`。
+Terminal-Bench 4 `html-js-filter` × 三臂（control=五机制全关 / treatment=全开软引导 / gate=全开+硬门，唯一实质差异=`plugins.options`），GLM-5.3-Flash，Harbor 0.23.0。**N=1，plumbing 验证级**——支持"机制管线在真实 TB 任务端到端工作"，不支持统计显著性。
+
+| 指标 | A control | B treatment | C gate |
+|---|---|---|---|
+| inputTokens | 8,805,055 | 5,980,884（−32.1%） | 3,505,890（−60.2%） |
+| API 折算 USD | $0.3464 | $0.2722（−21.4%） | $0.1890（−45.4%） |
+| 墙钟 | 53.1 min | 61.1 min（含节流噪声） | 59.6 min（含节流噪声） |
+| 请求数 / 异常 / reward | 77 / 无 / 1.0 | 50 / 无 / 0.0 | 30 / 无 / 1.0 |
+
+实测要点（与机制表述有出入处，以实测为准）：
+
+- **节省主通道是请求数坍缩（77→50→30）**，不是单请求变小（每请求 input 三臂恒定 114–120k）；归因 actionFusion 轮次收敛。
+- **软引导遵从方差极大**：同一 treatment 配置两极——0 次 sol_* 调用（run2）vs 21 次（存档 B）；bash 通道遵从仅 3/27。**gate 把变更通道方差消成常数**：1 次拦截 → 72 s 切换 → 100% 遵从，代价 ≈1.2 min。
+- B 臂未解系方案抽签（BeautifulSoup 重序列化被严格 verifier 拒；A/C 同题已解），不归因机制。
+- 全量 63×2 未跑：freeze / ledger / 断点续跑 / 限速看门狗已代码化并测试通过，`benchmark/run.py` 随时可扩；预算两档外推见 `benchmark/README.md`。
 
 ## 致谢与许可
 

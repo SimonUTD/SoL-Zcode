@@ -101,21 +101,39 @@ python3 run.py report --freeze-id <id>                # 4. ledger-derived report
   operator watching; the control arm is the remaining blind spot (see
   boundary note).
 
-## Cost and time budget (measured, updated per probe)
+## Cost and time budget (measured from the 2026-09-13 three-arm probe)
 
 Pricing: GLM-5.3-Flash per 1M tokens — input $0.15, output $0.50, cached
 input $0.03 (Z.ai international list, 2026-09-13; CN list ¥0.8/¥2.8/¥0.23 —
 see `pricing.py`). Actual consumption goes through the coding-plan quota;
 USD here is comparable accounting, not an invoice.
 
-| scope | cost (est.) | wall @ -n 4 (est.) |
-|---|---|---|
-| probe (1 task × 2 arms) | see `probe/*/summary.json` | ~1 h |
-| full 63 × 2 | extrapolate: per-arm cost × 126 | ~1–2 days |
+Measured per-task, per-arm (probe task `html-js-filter`, N=1; evidence in
+`probe/*/usage.json`, cross-checked by the P3 audit):
 
-Fill these from the probe numbers before the full run; do not trust
-estimates over measurements (SoL-OpenCode saw ~$0.08–0.12 per task-arm on a
-similarly priced model; zcode+GLM may differ).
+| arm | cost | wall | model requests |
+|---|---|---|---|
+| control | $0.3464 | 3,184 s (53.1 min) | 77 |
+| treatment | $0.2722 | 3,668 s (61.1 min)¹ | 50 |
+| gate (ablation arm, not in the default full run) | $0.1890 | 3,578 s (59.6 min)¹ | 30 |
+| **both default arms / task** | **$0.6186** | **6,852 s serial** | 127 |
+
+¹ Walls include one 21–32 min provider throttle stall per mechanism arm
+(observed: C first request 1,897 s, B one gap 1,287 s); net working time
+≈40 min (B) / ≈28 min (C).
+
+Full-run extrapolation (63 CPU tasks × 2 arms; two tiers, both carry
+rate-limit uncertainty):
+
+| tier | cost (list-price accounting) | wall | uncertainty |
+|---|---|---|---|
+| serial | ≈$39 (63 × $0.6186) | ≈120 h (63 × 6,852 s) | linear N=1 extrapolation |
+| `-n 4` | ≈$39 (cost does not drop with concurrency) | ideal ≈30 h; realistically **~1–2 days** | throttle frequency may rise with concurrency; treatment-side request collapse should partly offset it |
+
+These exceed the early DESIGN §7 estimate (~$10) because the probe task ran
+heavy (77 requests in control); SoL-OpenCode saw ~$0.08–0.12 per task-arm on
+a similarly priced model, so the true full-run mean may land lower — budget
+to the table's ceiling, replace with measured means as the ledger fills.
 
 ## Rate-limit degeneracy guard (audit MAJOR-1, 2026-09-14)
 

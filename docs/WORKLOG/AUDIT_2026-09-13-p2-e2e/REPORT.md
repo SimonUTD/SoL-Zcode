@@ -138,3 +138,54 @@ P2 交付质量整体高于 P1 v1（无 MAJOR）：真模型 e2e 是本项目迄
 5. m6：s3 断言 `verdict.startsWith("REACHES-MODEL")`。
 6. m2：DESIGN §8/G21 补高估方向说明（可选：预览尺寸计数）。
 7. m7/m8：修正 probe.mjs/s3 注释、声称字节数与 detail 模板。
+
+---
+
+# 复审（2026-09-13，P2 整改核验）
+
+- 对象：`1797090` "fix(P2-rework): all 8 audit MINORs + s8 then_run scenario"（工作树 clean；本报告 v1 文本经 diff 比对被**原样**提交进该 commit，未改动——仅此前为未跟踪文件，随整改一并入库）。DESIGN §2.4 校准说明包含在同一 commit（owner 回写）。
+- 方法：全量 diff（`d91ed64..1797090`，15 文件 +901/-129）逐行复核 → **m1 判别性独立双证**（/tmp 副本剥离锁后 3 进程×10 次并发 accumulate 实测 **12000/30000 丢失 60%**；原版锁定模块同负载实测 **恰好 30000**）→ **m2 前提反编译独立验证**（Bash resultBudget `maxInlineBytes=3e4`/`strategy:"artifact"`、信封 `previewChars=2e3`（通用 REr 与 Bash GMr/NJo 两处一致）、信封结构与插件实现逐行对齐）→ 复跑 `node scripts/run-tests.mjs`（**138/138**）→ **复跑 s6 真模型场景**（PASS 5/5，第 24 条记录）→ 7 场景复跑记录与 verify-evidence 内嵌结果逐条核对。
+
+## R1. 总体结论
+
+**终评分：9.5 / 10 —— 通过 P2 验收门（≥9.5）。**
+
+8 条 MINOR 全部按建议实质修复（非表面应付），且两处修复经本审核在更深层独立证实：m1 的锁不只是"加了"，其回归测试具有真实判别性（无锁时必败，本审核独立复现丢失率 60%）；m2 的校准不只是"改了公式"，其信封格式与模型实见前提均与 zcode.cjs 运行时反编译逐项吻合，s5 v6 的"估算字节=模型实见字节"由构造保证（28893B < Bash 30000B inline 截止，反编译证实）。新增 s8 场景质量与既有套件同水位（双路径+磁盘真值+requestOnly+自报+账本+真会话轨迹白名单）。整改未引入新缺陷；vendor core 与 MCP 层零改动（plugin/ 改动仅 chain/occ/sol-hook 三文件）。遗留 4 条 nano（见 R3），均不扣门。
+
+## R2. 逐条判定
+
+| 项 | 判定 | 复核证据 |
+|---|---|---|
+| m1 occ-state 无锁竞态 | **已修复（判别性双证）** | ① `withPluginLock`（chain.mjs）+ `withOccStateLock` 包住全部 5 个读改写入口（accumulate/Stop/TodoBoundary/Correction/testSeed），锁序唯一（occ 锁→账本锁，无死锁）；读者无锁依赖 tmp+rename 原子性（不撕裂）。② 单测：3 进程×10 次精确 30000 + occ-history 30 行严格单调 + 链完整；Stop 轮与 accumulate 交错无双丢。③ 本审核独立判别实验：剥锁副本 12000/30000（丢 60%），锁定版恰好 30000。④ 原 nano（appendChained 返回 null 时快照超前历史）一并修复：此时**不推进快照**（低估方向 fail-safe）。锁 3s 抢不到则无锁执行——liveness 优先，已文档化 |
+| m2 估算器高估校准 | **已修复（runtime 对齐独立验证）** | `occToolResponseBytes` 重写为"模型实见"口径：MCP `content[].text` 计实见文本（sol_* 占位符）；原生流未截断计全额 byte 字段、截断计 ~2KB persisted 信封。反编译证实：信封结构（`<persisted-output>`/notice/preview/`...`/闭合）与 `xne` 逐行一致；`previewChars=2e3` 在通用 REr 与 Bash GMr（NJo=2e3）两处一致；Bash inline 截止=30000B（resultBudget `Emt=3e4`，strategy=artifact）→ `seq 1 6000`=28893B 确为全量入上下文，v6"实见=计数"前提成立。s5 v6 重设计合理：T1=19865<21000 压缩下限（结构性不可触发，比 v5 的边际判据更强），T2=43550 由 4 次未截断输出的真实可见字节触发；blocks×2/自限 2/窗口 1M/compactionDetection=unavailable 全部复现。DESIGN §2.4 回写与实现一致（2000 字符信封、withPluginLock 3s fail-open、v6 数字） |
+| m3 verify-evidence 未进 e2e | **已修复** | harness 新增 `verifyEvidence()`；s2/s7 收尾对真 dataRoot 断言 exit 0 + "OK: all chains verified, all objects reconcile"（记录 notes.verifyEvidence 双双 code=0）——C3↔e2e 环闭合（s2 数据根覆盖 observation+reducer+occ 三类链与对象，s7 覆盖 fail-open 链）。残留 nano：s4/s5 未挂（非必需，见 R3-n4） |
+| m4 rolloutFindString 不钉 request 侧 | **已修复** | `requestOnly` 选项限定 `request.messages`（兼容 `request.body.messages`）；应用于 s2 回执、s5/s5b block reason、s7 全文/无占位、s8 三标记——共 8 处关键断言全部钉死请求侧，响应侧回显假绿路径关闭 |
+| m5 then_run 真模型零覆盖 | **已修复（超出建议）** | 新 s8 场景 13/13：成功路径（`[then_run:succeeded]`+wc -c 输出）与失败路径（`[then_run:failed]`+"file mutation above was applied"注记）双臂；断言含磁盘字节真值、requestOnly 三标记、模型自报（OK_BYTES=17/FAIL_MARKER/FAIL_NOTE=yes）、observation 账本 2×full、**真会话 trajectory 字段白名单+原文不出现**（把我 m5 的附带项一并闭合，DESIGN §6.3 该项从 fixture 级升到真会话级） |
+| m6 s3 恒真断言 | **已修复** | verdict=`REACHES-MODEL` 成为 PASS 条件（宿主回归将红）；另加"模型逐字回显"独立断言与防空洞负例对照（从未注入的对照 marker 必须在 rollout 中不可寻）；s3 现 9/9 且 verdict 记录为 REACHES-MODEL |
+| m7 过时矛盾注释 | **已修复** | probe.mjs/s3 注释改写为 G14 口径（rollout 有 request.messages、留存不保证长期、transcript 拷贝为第二视角），自相矛盾消除 |
+| m8 小误差 | **已修复** | s5 "occ state exists" detail 改为动态值；2032/2036B 为 brief 转述层笔误（commit 与记录本就一致），仓库内无需改动 |
+
+## R3. 新问题扫描（全部 nano，记录在案不扣分）
+
+- **n1**：Bash 截断信封的字节格式器与插件 `formatKb` 有 ±几字节差（宿主 GJo 按 /1024 `toFixed(1)`→"144.5KB"；插件按 /1000 取整→"148 KB"；另宿主 preview 回退到行首 newline）——~2.1KB 信封上 ±1%，估算器级精度如设计；单测拼的是通用 REr/N7o 格式（对通用格式器逐字节精确）。可选：代码注释补引 GMr/GJo。
+- **n2**：s5 v6 注释把 30000 截止归因 G6（hook payload 层）；模型实见 inline 截止实为 Bash resultBudget `Emt=3e4`（反编译）。常数恰同、结论不受影响，仅引用精度。
+- **n3**：`withPluginLock` 3s 抢锁失败后无锁执行——极端竞争下竞窗重现（有界、已文档化、liveness 论证成立；宿主 hook 超时 15-30s）。
+- **n4**：verify-evidence 挂在 s2/s7 而非建议原文的 s2/s4/s5——已覆盖三类链+fail-open 链的真数据对账，实质闭合；铺满 8 场景为可选优化。
+- 审核人复跑 s6 追加第 24 条记录（PASS 5/5，与开发方 06:44 记录等价）——审核留痕。
+
+## R4. 评分
+
+| 维度 | 权重 | 得分 | 依据 |
+|---|---|---|---|
+| 修复正确性与机制保真 | 30% | 9.5 | m1 锁正确+判别性单测+fail-open 文档化+nano 连带修复；m2 与运行时反编译对齐（本审核独立验证前提）；扣 n1-n3 nano |
+| 硬约束 C2/C3/C4 的 e2e 实证 | 30% | 9.5 | verify-evidence 进真数据回路（exit 0 落记录）；C2 复跑双证；C4 对抗全保持；扣 n4 |
+| e2e 测试真实性与覆盖 | 25% | 9.5 | requestOnly 全铺开、s8 双路径+真会话轨迹白名单、s3 结论成 PASS 条件+负例对照；DESIGN §6.3 清单项全部落地（压缩检测为已声明的宿主不可行） |
+| 工程质量与诚实度 | 15% | 9.5 | 8/8 如实整改、复跑记录完整（23 条）、DESIGN 同步、v1 报告原样入库未改 |
+
+**加权 2.85+2.85+2.375+1.425 = 9.5 → 终评分 9.5 / 10。P2 验收门通过，批准进入 P3。**
+
+## R5. 留给 P3 的在案事项（不扣门）
+
+- n3/n4 的可选加固（锁等待策略、verify-evidence 铺满场景）随 P3 顺手处理即可。
+- P3 容器 harness 必须显式设置 `SOL_ZCODE_ZCODE_BIN`（G22；e2e 已如此）；OCC 估算器在 sol_bash 为主的治疗臂口径准确，原生 Bash 大输出的信封估算是 ±1% 级近似（n1）。
+- 基准报告引用 s5 证据时按 v6 口径（T2=43550，模型实见字节构造）。

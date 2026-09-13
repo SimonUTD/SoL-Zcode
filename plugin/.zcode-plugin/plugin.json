@@ -1,0 +1,64 @@
+{
+  "name": "sol-zcode",
+  "version": "0.1.0",
+  "description": "SoL token-efficiency mechanisms (action fusion, observation pack, evidence-preserving reducer, online context compact, trajectory inspector) as a ZCode plugin. All mechanisms are opt-in and default off.",
+  "description_i18n": {
+    "en": "SoL token-efficiency mechanisms (action fusion, observation pack, evidence-preserving reducer, online context compact, trajectory inspector) as a ZCode plugin. All mechanisms are opt-in and default off.",
+    "zh-CN": "SoL 令牌效率机制（动作融合、观察包、证据保留型约简器、在线上下文压缩、轨迹检查器）的 ZCode 插件。所有机制默认关闭，需显式开启。"
+  },
+  "author": {
+    "name": "SoL-Zcode"
+  },
+  "license": "MIT",
+  "keywords": [
+    "token-efficiency",
+    "sol",
+    "observation-pack",
+    "action-fusion",
+    "evidence-reducer"
+  ],
+  "userConfig": {
+    "actionFusion": {
+      "type": "boolean",
+      "title": "Action Fusion",
+      "description": "Expose sol_write/sol_edit MCP tools that accept an optional then_run {command, timeout?} follow-up executed in the same call.",
+      "default": false
+    },
+    "observationPack": {
+      "type": "boolean",
+      "title": "Observation Pack",
+      "description": "Archive tool results over 10 KiB and return a compact placeholder; recall with obs_recall (paging + literal search). Also archives large native tool outputs read-only.",
+      "default": false
+    },
+    "evidenceReducer": {
+      "type": "boolean",
+      "title": "Evidence-Preserving Reducer",
+      "description": "Reduce long failing diagnostic logs (build/test) to a verified evidence receipt quoting exact lines; the original stays archived for readback.",
+      "default": false
+    },
+    "onlineCompact": {
+      "type": "boolean",
+      "title": "Online Context Compact",
+      "description": "Track plan boundaries and context economics; suggest compaction at economical points via the Stop hook and remind after compaction.",
+      "default": false
+    },
+    "trajectory": {
+      "type": "boolean",
+      "title": "Trajectory Inspector",
+      "description": "Append-only metadata-only JSONL trajectory with hash chain (never prompts/args/outputs); query with sol_trajectory.",
+      "default": false
+    },
+    "actionFusionGate": {
+      "type": "boolean",
+      "title": "Action Fusion hard gate",
+      "description": "Block native Write/Edit with exit-2 so the model must use sol_write/sol_edit. Optional ablation arm; leave off for normal use.",
+      "default": false
+    },
+    "reducerModel": {
+      "type": "string",
+      "title": "Reducer model",
+      "description": "Model id (provider/model) for the reducer subprocess. Empty = inherit the host model from ~/.zcode/cli/config.json.",
+      "default": ""
+    }
+  }
+}

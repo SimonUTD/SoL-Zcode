@@ -1,0 +1,11 @@
+# runtime artifacts (not source)
+.venv/
+dataset/
+spike/zcode.cjs
+spike/*.log
+assets/node/*.tar.xz
+probe/*/jobs/
+results/jobs/
+jobs/
+__pycache__/
+*.pyc

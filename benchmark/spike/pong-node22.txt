@@ -1,0 +1,30 @@
+== version on node v22.23.2: ==
+0.16.5
+version-exit=0
+{
+  "sessionId": "sess_2cdf1024-bcc0-428c-b94a-ae02ce4bd261",
+  "traceId": "7ee32454-74d9-4cd0-8b53-45dacc9e345c",
+  "turnId": "turn_abccf891-8b50-4d76-b642-c35c1330beb4",
+  "response": "PONG",
+  "usage": {
+    "source": "provider",
+    "modelRequestCount": 1,
+    "inputTokens": 9332,
+    "outputTokens": 20,
+    "totalTokens": 9352,
+    "cacheReadTokens": 64,
+    "cacheWriteTokens": 0,
+    "reasoningTokens": 0,
+    "webFetchRequests": 0,
+    "webSearchRequests": 0
+  },
+  "eventCount": 30,
+  "projection": {
+    "status": "idle",
+    "turnCount": 1,
+    "totalTokenCount": 9352,
+    "contextUsed": 9352,
+    "contextWindow": 1000000
+  }
+}
+pong-exit=0

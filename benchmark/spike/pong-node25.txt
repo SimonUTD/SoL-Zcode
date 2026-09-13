@@ -1,0 +1,29 @@
+cli config written: /root/.zcode/cli/config.json (provider=builtin:bigmodel-coding-plan, model=builtin:bigmodel-coding-plan/GLM-5.3-Flash, apiKey=<env>)
+== PONG test (node v25.9.0, linux aarch64) ==
+{
+  "sessionId": "sess_b5986125-bb17-4a78-85dd-695e0181814e",
+  "traceId": "dc4ab464-c64c-4cdc-afae-cf5ad53a926b",
+  "turnId": "turn_60b0da52-152b-43ff-a01a-1dff85484d2a",
+  "response": "PONG",
+  "usage": {
+    "source": "provider",
+    "modelRequestCount": 1,
+    "inputTokens": 9332,
+    "outputTokens": 4,
+    "totalTokens": 9336,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0,
+    "reasoningTokens": 0,
+    "webFetchRequests": 0,
+    "webSearchRequests": 0
+  },
+  "eventCount": 11,
+  "projection": {
+    "status": "idle",
+    "turnCount": 1,
+    "totalTokenCount": 9336,
+    "contextUsed": 9336,
+    "contextWindow": 1000000
+  }
+}
+== exit: 0 ==

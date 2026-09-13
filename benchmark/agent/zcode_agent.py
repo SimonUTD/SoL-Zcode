@@ -449,6 +449,21 @@ node --version
                 ((self._run_finished or time.monotonic()) - self._run_started) * 1000
             )
 
+        # Audit P3 MINOR-5: lift the watchdog's own evidence (gap list) into
+        # the trial metadata BEFORE the payload-None early return — the real
+        # abort scenario (process group killed -> zcode.txt truncated ->
+        # payload None) is exactly the path that must carry it, so the ledger
+        # line gets `rateLimitAbort` on both paths.
+        abort_marker = self._read_abort_marker()
+        if abort_marker is not None:
+            meta["rateLimitAbort"] = {
+                "reason": abort_marker.get("reason"),
+                "abortSec": abort_marker.get("abortSec"),
+                "consecutive": abort_marker.get("consecutive"),
+                "ts": abort_marker.get("ts"),
+                "evidence": (abort_marker.get("verdict") or {}).get("evidence"),
+            }
+
         if payload is None:
             meta["exception"] = "json-parse-failed" if raw.strip() else "no-output"
             context.metadata = {"zcode": meta}
@@ -482,17 +497,6 @@ node --version
             responsePreview=(payload.get("response") or "")[:400] or None,
             contextWindow=payload.get("projection", {}).get("contextWindow"),
         )
-        abort_marker = self._read_abort_marker()
-        if abort_marker is not None:
-            # Lift the watchdog's own evidence (gap list) into the trial
-            # metadata so the ledger line carries the abort cause verbatim.
-            meta["rateLimitAbort"] = {
-                "reason": abort_marker.get("reason"),
-                "abortSec": abort_marker.get("abortSec"),
-                "consecutive": abort_marker.get("consecutive"),
-                "ts": abort_marker.get("ts"),
-                "evidence": (abort_marker.get("verdict") or {}).get("evidence"),
-            }
         context.metadata = {"zcode": meta}
 
 

@@ -1,6 +1,6 @@
 {
   "name": "sol-zcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SoL token-efficiency mechanisms (action fusion, observation pack, evidence-preserving reducer, online context compact, trajectory inspector) as a ZCode plugin. All mechanisms are opt-in and default off.",
   "description_i18n": {
     "en": "SoL token-efficiency mechanisms (action fusion, observation pack, evidence-preserving reducer, online context compact, trajectory inspector) as a ZCode plugin. All mechanisms are opt-in and default off.",
@@ -20,44 +20,44 @@
   "userConfig": {
     "actionFusion": {
       "type": "boolean",
-      "title": "Action Fusion",
-      "description": "Expose sol_write/sol_edit MCP tools that accept an optional then_run {command, timeout?} follow-up executed in the same call.",
+      "title": "动作融合 (actionFusion)",
+      "description": "提供 sol_write / sol_edit 工具：写文件或改文件时可带 then_run {command, timeout?}，在同一调用里先完成修改、再执行验证命令，一次往返拿回综合结果，省掉一半轮次。开启后模型会收到使用引导。",
       "default": false
     },
     "observationPack": {
       "type": "boolean",
-      "title": "Observation Pack",
-      "description": "Archive tool results over 10 KiB and return a compact placeholder; recall with obs_recall (paging + literal search). Also archives large native tool outputs read-only.",
+      "title": "观察包 (observationPack)",
+      "description": "超过 10 KiB 的命令输出改为内容寻址归档，先返回紧凑占位符（含开头/结尾摘录与 obs_ 编号），需要细节时用 obs_recall 分页取回或搜索；原文永久落盘可查。同时对原生工具的大输出做只读归档。",
       "default": false
     },
     "evidenceReducer": {
       "type": "boolean",
-      "title": "Evidence-Preserving Reducer",
-      "description": "Reduce long failing diagnostic logs (build/test) to a verified evidence receipt quoting exact lines; the original stays archived for readback.",
+      "title": "证据保留型约简器 (evidenceReducer)",
+      "description": "冗长的构建/测试失败日志自动压缩成证据回执：逐字引用关键报错行并附归档路径。每条引用都经原文逐字节核验，核验不过就原样返回全文（绝不丢证据）。注意：每次触发会额外调用一次归约模型（消耗少量 token 与约 30-90 秒）。",
       "default": false
     },
     "onlineCompact": {
       "type": "boolean",
-      "title": "Online Context Compact",
-      "description": "Track plan boundaries and context economics; suggest compaction at economical points via the Stop hook and remind after compaction.",
+      "title": "在线上下文压缩 (onlineCompact)",
+      "description": "跟踪计划步骤完成边界与上下文增长经济学；在划算的时机经 Stop 提醒模型收敛上下文（自限每会话最多 3 次）。实际压缩由 ZCode 原生自动压缩兜底。",
       "default": false
     },
     "trajectory": {
       "type": "boolean",
-      "title": "Trajectory Inspector",
-      "description": "Append-only metadata-only JSONL trajectory with hash chain (never prompts/args/outputs); query with sol_trajectory.",
+      "title": "轨迹检查器 (trajectory)",
+      "description": "仅元数据的运行轨迹账本（JSONL + 哈希链防篡改）：记录操作、请求、工具使用与结果状态，绝不记录提示词、参数或输出内容。可用 sol_trajectory 工具查询、verify-evidence 脚本验真。",
       "default": false
     },
     "actionFusionGate": {
       "type": "boolean",
-      "title": "Action Fusion hard gate",
-      "description": "Block native Write/Edit with exit-2 so the model must use sol_write/sol_edit. Optional ablation arm; leave off for normal use.",
+      "title": "动作融合硬门（激进，默认关）(actionFusionGate)",
+      "description": "硬性拦截原生 Write/Edit/MultiEdit，强制模型改用 sol_write/sol_edit。遵从度最彻底（实测 1 次拦截后 100% 切换），但若 MCP 服务未启动会导致无法写文件，普通使用请保持关闭。",
       "default": false
     },
     "reducerModel": {
       "type": "string",
-      "title": "Reducer model",
-      "description": "Model id (provider/model) for the reducer subprocess. Empty = inherit the host model from ~/.zcode/cli/config.json.",
+      "title": "约简器模型 (reducerModel)",
+      "description": "证据约简器调用的模型 id（格式 provider/model，如 builtin:bigmodel-coding-plan/GLM-5.3-Flash）。留空 = 继承当前主模型（推荐，凭据与模型仍由 ZCode 统一管理）。",
       "default": ""
     }
   }

@@ -21,26 +21,76 @@
 - **证据保留**：原文先归档后替换（内容寻址、`O_EXCL`、0600）；账本 append-only + hash 链；`scripts/verify-evidence.mjs` 揭露任何行内改写/中段删插；回执附 `source_artifact` 路径与 readback 指引。
 - **宿主管辖权**：身份验证、provider URL、模型选择、shell 行为全部由 Zcode 自身配置决定（归约子进程继承宿主配置，插件不持有任何凭据）。
 
-## 安装
+## 安装与配置（完整指南）
 
+### 一、安装（三选一）
+
+**方式 A：ZCode 客户端 UI（推荐普通用户）**
+1. 打开 ZCode → 「发现」（Discover）标签页 → 点 **+**；
+2. 选择「本地目录」，填本仓库的本地路径（如 `/Volumes/ti600/SoL-Zcode`，或 clone 后的任意路径）——仓库根目录自带 `marketplace.json` 会被识别为本地市场；
+3. 在列表中找到 **sol-zcode** → 点「获取」安装 → 用开关启用；
+4. 重启会话（插件配置在会话启动时快照，改完必须新开会话）。
+
+**方式 B：脚本安装（开发/基准/自动化）**
 ```bash
-# 本地安装（开发/测试）
+# 仅安装（全关）
+node scripts/install-plugin.mjs plugin sol-zcode-dev
+
+# 安装并全开五机制
 node scripts/install-plugin.mjs plugin sol-zcode-dev --options '{"actionFusion":true,"observationPack":true,"evidenceReducer":true,"onlineCompact":true,"trajectory":true}'
+
+# 装到隔离 HOME（不污染本机环境，测试用）
+node scripts/install-plugin.mjs plugin sol-zcode-dev --home /tmp/some-home --options '{}'
 ```
+`--options` 为**替换语义**（传 `{}` 即全关；缺省不动现有配置）。
 
-或在 ZCode 客户端「发现」页添加本地市场安装。`--options` 为**替换语义**（传 `{}` 即全关）。
+**方式 C：从 GitHub 获取**：clone 本仓库后同方式 A/B。
 
-## Opt-in 配置
+### 二、开启机制（配置界面在哪）
 
-开关写在 `~/.zcode/cli/config.json` 的 `plugins.options["sol-zcode@<marketplace>"]`（客户端插件设置界面保存的就是这里）：
+所有机制**默认关闭**。开启方式三选一（效果等价，写入同一处）：
+
+**路径 1：客户端 UI**
+设置 → 插件管理 → **sol-zcode** → 拉到**页面最底部**的「高级配置」（默认折叠，点开）→ 勾选你要的机制（配置项已中文化，含每项行为说明）→ 保存 → **重启会话**。
+
+**路径 2：直接改配置文件** `~/.zcode/cli/config.json`
+```json
+"plugins": {
+  "enabledPlugins": { "sol-zcode@<marketplace>": true },
+  "options": {
+    "sol-zcode@<marketplace>": {
+      "actionFusion": true,
+      "observationPack": true,
+      "evidenceReducer": true,
+      "onlineCompact": true,
+      "trajectory": true
+    }
+  }
+}
+```
+⚠️ 此文件还含你的模型/provider 配置，只改 `plugins` 段，别动其他键。改完**重启会话**。
+
+**路径 3：脚本**（见方式 B 的 `--options`）
+
+### 三、开关速查
 
 | 键 | 类型/默认 | 说明 |
 |---|---|---|
-| `actionFusion` / `observationPack` / `evidenceReducer` / `onlineCompact` / `trajectory` | bool / `false` | 五机制独立开关 |
-| `actionFusionGate` | bool / `false` | 对原生 Write/Edit 等变异工具 exit-2 硬引导改用 sol_* 工具（默认软引导）。探针实测（N=1）：1 次拦截后 72 s 内切换、此后变更通道 100% 走 sol_*、零反复，代价 ≈1.2 min |
-| `reducerModel` | string / `""` | 归约模型；空 = 继承宿主当前模型（Zcode 决定） |
+| `actionFusion` | bool / `false` | sol_write/sol_edit 支持 then_run：改文件+跑验证一次调用完成，省一半轮次 |
+| `observationPack` | bool / `false` | >10KiB 输出改占位符（含头尾摘录+obs_ 编号），obs_recall 分页取回；原文永久归档 |
+| `evidenceReducer` | bool / `false` | 冗长失败日志压缩为逐字核验过的证据回执（每次触发额外调一次归约模型，+30~90 秒） |
+| `onlineCompact` | bool / `false` | 计划边界+上下文经济学，划算时机提醒收敛（自限 ≤3 次/会话） |
+| `trajectory` | bool / `false` | 仅元数据轨迹账本（hash 链防篡改，永不记录提示/参数/输出） |
+| `actionFusionGate` | bool / `false` | 硬门：物理拦截原生 Write/Edit 逼模型用 sol_*（激进选项；探针实测 N=1：1 次拦截后 72s 切换、此后 100% 走 sol_*、零反复，代价 ≈1.2 分钟。MCP 未启动时会导致无法写文件，普通使用保持关闭） |
+| `reducerModel` | string / `""` | 约简器模型 id（`provider/model`）；空 = 继承主模型（推荐，凭据/模型仍由 ZCode 统一管理） |
 
 类型非法的键按 false 处理并记一条 `config_rejected` 轨迹（可诊断 opt-in 拼写错误）。
+
+### 四、开启后你会看到什么 / 数据在哪
+
+- 模型会收到一段引导（优先使用 sol_* 工具）；工具列表出现 `sol_write / sol_edit / sol_bash / obs_recall / sol_trajectory`；
+- 插件数据落盘在 `~/.zcode/cli/plugins/data/sol-zcode@<marketplace>/store/`（观察包对象、证据归档、账本、轨迹，全部 0600 权限、追加式+哈希链）；
+- 验证证据完整性：`node plugin/scripts/verify-evidence.mjs`（对账哈希链与归档对象，任何篡改/缺失会逐行报出）；
 
 ## 测试
 

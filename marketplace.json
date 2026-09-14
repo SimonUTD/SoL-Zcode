@@ -1,0 +1,14 @@
+{
+  "name": "sol-zcode-marketplace",
+  "description": "Local marketplace for the sol-zcode plugin (SoL token-efficiency mechanisms for ZCode). Add this repository directory as a local marketplace in ZCode Discover to install.",
+  "plugins": [
+    {
+      "name": "sol-zcode",
+      "source": "./plugin",
+      "version": "0.1.1",
+      "description": "SoL token-efficiency mechanisms: action fusion, observation pack, evidence-preserving reducer, online context compact, trajectory inspector. Opt-in, default off.",
+      "category": "efficiency",
+      "tags": ["token-efficiency", "sol", "observation-pack", "action-fusion", "evidence-reducer", "trajectory"]
+    }
+  ]
+}
